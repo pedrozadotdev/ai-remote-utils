@@ -1,0 +1,35 @@
+name: Release Go Binaries
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  releases-matrix:
+    name: Release Go Binary
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        goos: [linux]
+        goarch: [amd64]
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set APP_VERSION env
+      run: echo APP_VERSION=$(echo ${GITHUB_REF} | rev | cut -d'/' -f 1 | rev ) >> ${GITHUB_ENV}
+
+    - name: Environment Printer
+      uses: managedkaos/print-env@v1.0
+
+    - uses: wangyoucao577/go-release-action@v1.53
+      with:
+        binary_name: "utproxy"
+        asset_name: "utproxy_${{ matrix.goos }}_${{ matrix.goarch }}"
+        extra_files: LICENSE README.md
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        md5sum: false
+        overwrite: true
+        goos: ${{ matrix.goos }}
+        goarch: ${{ matrix.goarch }}
+        pre_command: export GO386=softfloat CGO_ENABLED=0
+        ldflags: -s -w -X "github.com/pedrozadotdev/ai-remote-utils/cmd.Version=${{ env.APP_VERSION }}"

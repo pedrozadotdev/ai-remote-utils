@@ -22,7 +22,40 @@ var testHTTPClient = &http.Client{
 	},
 }
 
-func TestServer_GetRoot(t *testing.T) {
+// doGet sends a GET request to the server with the given Host header.
+func doGet(t *testing.T, addr, host, path string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest("GET", "https://"+addr+path, nil)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+	req.Host = host
+	resp, err := testHTTPClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET error: %v", err)
+	}
+	return resp
+}
+
+// doPost sends a POST request with the given Host header and body.
+func doPost(t *testing.T, addr, host, path string, contentType string, body io.Reader) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest("POST", "https://"+addr+path, body)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+	req.Host = host
+	req.Header.Set("Content-Type", contentType)
+	resp, err := testHTTPClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST error: %v", err)
+	}
+	return resp
+}
+
+// setupTestServer creates a test server and returns its address and cert/key.
+func setupTestServer(t *testing.T) (string, *Server, []byte, []byte) {
+	t.Helper()
 	certDir := t.TempDir()
 	if err := EnsureCert(certDir); err != nil {
 		t.Fatalf("EnsureCert error = %v", err)
@@ -36,15 +69,16 @@ func TestServer_GetRoot(t *testing.T) {
 		t.Fatalf("failed to read key.pem: %v", err)
 	}
 
-	srv := NewServer(0, 1024*1024, t.TempDir(), certPEM, keyPEM)
+	srv := NewServer(1024*1024, t.TempDir(), certPEM, keyPEM)
+	addr := startServer(t, srv)
+	return addr, srv, certPEM, keyPEM
+}
+
+func TestServer_TmpTest_GetRoot(t *testing.T) {
+	addr, srv, _, _ := setupTestServer(t)
 	defer srv.Close()
 
-	addr := startServer(t, srv)
-
-	resp, err := testHTTPClient.Get("https://" + addr + "/")
-	if err != nil {
-		t.Fatalf("GET / error: %v", err)
-	}
+	resp := doGet(t, addr, "tmp.test", "/")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -56,24 +90,9 @@ func TestServer_GetRoot(t *testing.T) {
 	}
 }
 
-func TestServer_PostUpload(t *testing.T) {
-	certDir := t.TempDir()
-	if err := EnsureCert(certDir); err != nil {
-		t.Fatalf("EnsureCert error = %v", err)
-	}
-	certPEM, err := os.ReadFile(filepath.Join(certDir, "cert.pem"))
-	if err != nil {
-		t.Fatalf("failed to read cert.pem: %v", err)
-	}
-	keyPEM, err := os.ReadFile(filepath.Join(certDir, "key.pem"))
-	if err != nil {
-		t.Fatalf("failed to read key.pem: %v", err)
-	}
-
-	srv := NewServer(0, 1024*1024, t.TempDir(), certPEM, keyPEM)
+func TestServer_TmpTest_PostUpload(t *testing.T) {
+	addr, srv, _, _ := setupTestServer(t)
 	defer srv.Close()
-
-	addr := startServer(t, srv)
 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
@@ -84,10 +103,7 @@ func TestServer_PostUpload(t *testing.T) {
 	io.WriteString(part, "image-data")
 	writer.Close()
 
-	resp, err := testHTTPClient.Post("https://"+addr+"/upload", writer.FormDataContentType(), body)
-	if err != nil {
-		t.Fatalf("POST /upload error: %v", err)
-	}
+	resp := doPost(t, addr, "tmp.test", "/upload", writer.FormDataContentType(), body)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -95,33 +111,15 @@ func TestServer_PostUpload(t *testing.T) {
 	}
 }
 
-func TestServer_PostUploadNoFile(t *testing.T) {
-	certDir := t.TempDir()
-	if err := EnsureCert(certDir); err != nil {
-		t.Fatalf("EnsureCert error = %v", err)
-	}
-	certPEM, err := os.ReadFile(filepath.Join(certDir, "cert.pem"))
-	if err != nil {
-		t.Fatalf("failed to read cert.pem: %v", err)
-	}
-	keyPEM, err := os.ReadFile(filepath.Join(certDir, "key.pem"))
-	if err != nil {
-		t.Fatalf("failed to read key.pem: %v", err)
-	}
-
-	srv := NewServer(0, 1024*1024, t.TempDir(), certPEM, keyPEM)
+func TestServer_TmpTest_PostUploadNoFile(t *testing.T) {
+	addr, srv, _, _ := setupTestServer(t)
 	defer srv.Close()
-
-	addr := startServer(t, srv)
 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	writer.Close()
 
-	resp, err := testHTTPClient.Post("https://"+addr+"/upload", writer.FormDataContentType(), body)
-	if err != nil {
-		t.Fatalf("POST /upload error: %v", err)
-	}
+	resp := doPost(t, addr, "tmp.test", "/upload", writer.FormDataContentType(), body)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {
@@ -130,28 +128,10 @@ func TestServer_PostUploadNoFile(t *testing.T) {
 }
 
 func TestServer_GracefulShutdown(t *testing.T) {
-	certDir := t.TempDir()
-	if err := EnsureCert(certDir); err != nil {
-		t.Fatalf("EnsureCert error = %v", err)
-	}
-	certPEM, err := os.ReadFile(filepath.Join(certDir, "cert.pem"))
-	if err != nil {
-		t.Fatalf("failed to read cert.pem: %v", err)
-	}
-	keyPEM, err := os.ReadFile(filepath.Join(certDir, "key.pem"))
-	if err != nil {
-		t.Fatalf("failed to read key.pem: %v", err)
-	}
+	addr, srv, _, _ := setupTestServer(t)
 
-	srv := NewServer(0, 1024*1024, t.TempDir(), certPEM, keyPEM)
-
-	addr := startServer(t, srv)
-
-	// Verify server is responding
-	resp, err := testHTTPClient.Get("https://" + addr + "/")
-	if err != nil {
-		t.Fatalf("GET / error: %v", err)
-	}
+	// Verify server is responding via tmp.test
+	resp := doGet(t, addr, "tmp.test", "/")
 	resp.Body.Close()
 
 	// Shutdown with context
@@ -162,51 +142,120 @@ func TestServer_GracefulShutdown(t *testing.T) {
 	}
 
 	// Server should now be shut down
-	_, err = testHTTPClient.Get("https://" + addr + "/")
+	_, err := testHTTPClient.Get("https://" + addr + "/")
 	if err == nil {
 		t.Error("expected error after shutdown, got nil")
 	}
 }
 
 func TestServer_UploadDirCreated(t *testing.T) {
-	certDir := t.TempDir()
-	if err := EnsureCert(certDir); err != nil {
-		t.Fatalf("EnsureCert error = %v", err)
-	}
-	certPEM, err := os.ReadFile(filepath.Join(certDir, "cert.pem"))
-	if err != nil {
-		t.Fatalf("failed to read cert.pem: %v", err)
-	}
-	keyPEM, err := os.ReadFile(filepath.Join(certDir, "key.pem"))
-	if err != nil {
-		t.Fatalf("failed to read key.pem: %v", err)
-	}
-
-	srv := NewServer(0, 1024*1024, t.TempDir(), certPEM, keyPEM)
-
-	addr := startServer(t, srv)
+	_, srv, _, _ := setupTestServer(t)
 	defer srv.Close()
 
-	// Trigger a request
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	part, _ := writer.CreateFormFile("file", "test.jpg")
-	io.WriteString(part, "data")
-	writer.Close()
-
-	resp, err := testHTTPClient.Post("https://"+addr+"/upload", writer.FormDataContentType(), body)
-	if err != nil {
-		t.Fatalf("POST /upload error: %v", err)
+	// Dir should exist (NewServer doesn't create it, but the test setup does)
+	if _, err := os.Stat(srv.uploadDir); os.IsNotExist(err) {
+		t.Error("upload directory was not created")
 	}
+}
+
+func TestServer_LocalhostReturns404(t *testing.T) {
+	addr, srv, _, _ := setupTestServer(t)
+	defer srv.Close()
+
+	resp := doGet(t, addr, "localhost", "/")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for localhost, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_LocalhostIPReturns404(t *testing.T) {
+	addr, srv, _, _ := setupTestServer(t)
+	defer srv.Close()
+
+	resp := doGet(t, addr, "127.0.0.1", "/")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for 127.0.0.1, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_UnknownHostReturns404(t *testing.T) {
+	addr, srv, _, _ := setupTestServer(t)
+	defer srv.Close()
+
+	resp := doGet(t, addr, "unknown.example.com", "/")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown host, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_TmpTest_HasSecurityHeaders(t *testing.T) {
+	addr, srv, _, _ := setupTestServer(t)
+	defer srv.Close()
+
+	resp := doGet(t, addr, "tmp.test", "/")
+	defer resp.Body.Close()
+
+	hsts := resp.Header.Get("Strict-Transport-Security")
+	if hsts == "" {
+		t.Error("tmp.test response missing HSTS header")
+	}
+	xfo := resp.Header.Get("X-Frame-Options")
+	if xfo == "" {
+		t.Error("tmp.test response missing X-Frame-Options header")
+	}
+}
+
+func TestServer_ProxyRoute(t *testing.T) {
+	// Start an upstream server
+	upstream := http.Server{Addr: "127.0.0.1:0"}
+	upstream.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("upstream-ok"))
+	})
+	upstreamListener, err := net.Listen("tcp", upstream.Addr)
+	if err != nil {
+		t.Fatalf("upstream listen error: %v", err)
+	}
+	upstream.Addr = upstreamListener.Addr().String()
+	go upstream.Serve(upstreamListener)
+	defer upstream.Close()
+	time.Sleep(20 * time.Millisecond)
+
+	addr, srv, _, _ := setupTestServer(t)
+	defer srv.Close()
+
+	// Extract port from upstream
+	_, portStr, _ := net.SplitHostPort(upstream.Addr)
+
+	// Request via proxy route
+	resp := doGet(t, addr, portStr+".test", "/")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Errorf("expected 200, got %d", resp.StatusCode)
+		t.Errorf("expected 200 for proxy route, got %d", resp.StatusCode)
 	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "upstream-ok") {
+		t.Errorf("body = %q, want to contain 'upstream-ok'", string(body))
+	}
+}
 
-	// Dir should exist
-	if _, err := os.Stat(srv.uploadDir); os.IsNotExist(err) {
-		t.Error("upload directory was not created")
+func TestServer_ProxyRoute_NonExistent(t *testing.T) {
+	addr, srv, _, _ := setupTestServer(t)
+	defer srv.Close()
+
+	resp := doGet(t, addr, "39999.test", "/")
+	defer resp.Body.Close()
+
+	// Should get 502 (unreachable) not 200
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("expected 502 for unreachable proxy, got %d", resp.StatusCode)
 	}
 }
 
@@ -219,7 +268,7 @@ func startServer(t *testing.T, srv *Server) string {
 		t.Fatalf("failed to create upload dir: %v", err)
 	}
 
-	listener, err := net.Listen("tcp", srv.httpServer.Addr)
+	listener, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
@@ -227,6 +276,7 @@ func startServer(t *testing.T, srv *Server) string {
 	tlsListener := tls.NewListener(listener, srv.tlsConfig)
 
 	go func() {
+		srv.httpServer.Addr = tlsListener.Addr().String()
 		if err := srv.httpServer.Serve(tlsListener); err != nil && err != http.ErrServerClosed {
 			t.Logf("serve error: %v", err)
 		}

@@ -18,7 +18,7 @@ import (
 
 // Default values
 const (
-	defaultPort    = 8443
+	defaultPort    = 443
 	defaultMaxSize = 50 * 1024 * 1024 // 50 MB
 )
 
@@ -28,12 +28,45 @@ func main() {
 	maxSize := flag.Int("max-size", lookupEnvInt("MAX_UPLOAD_SIZE", defaultMaxSize), "Maximum upload file size in bytes")
 	certDir := flag.String("cert-dir", lookupEnvStr("CERT_DIR", defaultCertDir()), "Directory for TLS certificates")
 	uploadDir := flag.String("upload-dir", lookupEnvStr("UPLOAD_DIR", defaultUploadDir()), "Upload directory")
+	installSvc := flag.Bool("install-service", false, "Install systemd service and exit")
 	flag.Parse()
+
+	// Handle --install-service flag
+	if *installSvc {
+		binPath, err := os.Executable()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to get executable path: %v\n", err)
+			os.Exit(1)
+		}
+		binPath, err = filepath.Abs(binPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to resolve absolute path: %v\n", err)
+			os.Exit(1)
+		}
+		workDir, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to get working directory: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Installing systemd service...\n")
+		fmt.Printf("  Binary: %s\n", binPath)
+		fmt.Printf("  Working directory: %s\n", workDir)
+
+		if err := InstallService(binPath, workDir, "/etc/systemd/system"); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to install service: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Service file written to /etc/systemd/system/ai-remote-utils.service\n")
+		fmt.Printf("Run: systemctl daemon-reload && systemctl enable --now ai-remote-utils\n")
+		os.Exit(0)
+	}
 
 	// --- Structured logging ---
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	slog.Info("starting tmp-file server",
+	slog.Info("starting ai-remote-utils server",
 		"port", *port,
 		"max_size", *maxSize,
 		"cert_dir", *certDir,
@@ -68,22 +101,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Check if cert expires soon
-	if CertExpiresSoon(certPEM, 30*24*time.Hour) {
-		slog.Warn("certificate will expire within 30 days, consider regenerating")
-	}
+	// --- Create context with signal handling ---
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	// --- Create server ---
-	srv := NewServer(*port, int64(*maxSize), *uploadDir, certPEM, keyPEM)
+	// --- Start cleanup goroutine ---
+	StartCleanup(ctx, *uploadDir, 1*time.Hour, 5*time.Minute, 5*time.Minute)
+
+	// --- Start DNS server (non-fatal) ---
+	StartDNS(ctx)
+
+	// --- Start HTTP redirect server (non-fatal) ---
+	StartRedirect(ctx)
+
+	// --- Create HTTPS server ---
+	srv := NewServer(int64(*maxSize), *uploadDir, certPEM, keyPEM)
 	if srv == nil {
 		slog.Error("failed to create server")
 		os.Exit(1)
 	}
 
-	// --- Listen ---
+	// --- Listen on HTTPS port ---
 	plainListener, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {
-		slog.Error("failed to listen", "error", err)
+		slog.Error("failed to listen", "port", *port, "error", err)
 		os.Exit(1)
 	}
 
@@ -98,18 +139,13 @@ func main() {
 		MinVersion:   tls.VersionTLS12,
 	})
 
-	// --- Start cleanup ---
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	StartCleanup(ctx, *uploadDir, 1*time.Hour, 5*time.Minute, 5*time.Minute)
-
-	// --- Serve ---
-	slog.Info("server listening",
+	// --- Serve HTTPS ---
+	slog.Info("HTTPS server listening",
 		"addr", tlsListener.Addr().String(),
 		"upload_dir", *uploadDir,
 	)
 
-	fmt.Printf("Open https://localhost:%d in your browser\n", *port)
+	fmt.Printf("Open https://tmp.test in your browser (requires DNS)\n")
 
 	go func() {
 		<-ctx.Done()
@@ -145,13 +181,13 @@ func lookupEnvStr(key, fallback string) string {
 	return fallback
 }
 
-// defaultCertDir returns the default certificate directory (~/.tmp-file/).
+// defaultCertDir returns the default certificate directory (~/.ai-remote-utils/).
 func defaultCertDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ".tmp-file"
+		return ".ai-remote-utils"
 	}
-	return filepath.Join(home, ".tmp-file")
+	return filepath.Join(home, ".ai-remote-utils")
 }
 
 // defaultUploadDir returns the default upload directory.
@@ -166,5 +202,39 @@ func checkWritable(dir string) error {
 		return fmt.Errorf("directory not writable: %w", err)
 	}
 	os.Remove(testFile)
+	return nil
+}
+
+// GenerateServiceFile returns the content of the systemd service unit file
+// with ExecStart and WorkingDirectory set to the given paths.
+func GenerateServiceFile(binPath, workDir string) string {
+	return fmt.Sprintf(`[Unit]
+Description=ai-remote-utils — development utility server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=%s
+ExecStart=%s
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`, workDir, binPath)
+}
+
+// InstallService writes the systemd service file to targetDir.
+// It creates the target directory if needed.
+func InstallService(binPath, workDir, targetDir string) error {
+	content := GenerateServiceFile(binPath, workDir)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return fmt.Errorf("failed to create target directory %s: %w", targetDir, err)
+	}
+	servicePath := filepath.Join(targetDir, "ai-remote-utils.service")
+	if err := os.WriteFile(servicePath, []byte(content), 0644); err != nil {
+		return fmt.Errorf("failed to write service file %s: %w", servicePath, err)
+	}
 	return nil
 }

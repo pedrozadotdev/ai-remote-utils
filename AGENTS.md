@@ -1,4 +1,4 @@
-# AGENTS.md — AI Agent Rules for tmp-file
+# AGENTS.md — AI Agent Rules for ai-remote-utils
 
 This file documents conventions, constraints, and skill mappings for AI agents working on this project.
 
@@ -9,10 +9,15 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 | Add or modify a Go feature | Edit `.go` files in package `main`. Follow table-driven test pattern. |
 | Change upload behavior | `upload.go` — `UploadHandler.ServeHTTP` + `upload_test.go` |
 | Change cleanup behavior | `cleanup.go` — `cleanupOnce` + `StartCleanup` ; `cleanup_test.go` |
-| Change TLS/cert behavior | `cert.go` — cert generation, expiry, persistence; `cert_test.go` |
-| Add/change routes or middleware | `server.go` — `NewServer` mux setup + `server_test.go` |
+| Change TLS/cert behavior | `cert.go` — cert generation, SAN detection, expiry, persistence; `cert_test.go` |
+| Change DNS behavior | `dns.go` — `StartDNS`, wire protocol, interface matching; `dns_test.go` |
+| Change reverse proxy | `proxy.go` — `ParseTestSubdomain`, `NewReverseProxy`; `proxy_test.go` |
+| Change HTTP redirect | `redirect.go` — `StartRedirect`; `redirect_test.go` |
+| Add/change routes or middleware | `server.go` — `NewServer` virtual host mux; `server_test.go` |
+| Change main.go wiring | `main.go` — flag parsing, listener orchestration, signal handling |
 | Update frontend UI | `static/index.html` — single embedded HTML file |
 | Add embedded static asset | `static.go` — embed via `//go:embed static` directive |
+| Change systemd service | `ai-remote-utils.service` — unit file |
 | Document a solved problem | `~/.pi/agent/docs/solutions/<category>/` (global solutions) |
 | Review code changes | `docs/reviews/<date>-<topic>.md` using `04-review` skill |
 
@@ -40,15 +45,25 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 ### Security rules
 - **Private key permissions**: `os.WriteFile(keyPath, keyPEM, 0600)` — never 0644
 - **TLS MinVersion**: `tls.VersionTLS12` minimum
-- **Security headers**: `securityHeaders()` middleware on all routes
+- **Security headers**: `securityHeaders()` middleware on upload routes only, not proxy routes
 - **Upload size limit**: `http.MaxBytesReader` per request, configurable
 - **Multi-file upload**: iterate `r.MultipartForm.File["files"]`, not `r.FormFile()`
 - **Startup checks**: writability check once at startup, not per-request (avoids TOCTOU)
+- **DNS**: only respond to `.test` queries; non-.test gets REFUSED (allows client fallback to secondary DNS; still prevents open resolver since no data is returned for arbitrary domains)
 
 ### Clean naming conventions
 - 4-char random alphanumeric filenames (a-z, 0-9)
 - Extension preserved from original filename, fallback `.bin`
 - Mutex-protected name generation with collision retry (max 10)
+
+### Reverse proxy conventions
+- `ParseTestSubdomain` extracts port from `<port>.test` hostnames
+- Case-insensitive matching
+- Strips `:443` port suffix before matching
+- Blocked ports: 53, 80, 443 (prevents loops)
+- Host header preserved as `*.test` (not rewritten to localhost)
+- `URL.Scheme` → `http`, `URL.Host` → `localhost:<port>` for TCP routing
+- Default transport enables WebSocket upgrades
 
 ### Review triggers
 When these code patterns appear in a diff, flag for review:
@@ -56,6 +71,8 @@ When these code patterns appear in a diff, flag for review:
 - `r.FormFile("files")` when multi-file support is expected
 - Startup checks repeated inside per-request handlers
 - Nested guard conditions where outer condition implies inner
+- Proxy Director modifying `r.Host` (should preserve original)
+- DNS responses for non-`.test` domains that return data (ensure REFUSED is not accidentally changed to success or NXDOMAIN)
 
 ## Pipeline Workflow
 
@@ -81,5 +98,5 @@ Global solutions at `~/.pi/agent/docs/solutions/`:
 ## Build
 
 ```bash
-go build -o tmp-file .  # Produces ~9.4MB static binary
+go build -o ai-remote-utils .  # Produces ~10MB static binary
 ```

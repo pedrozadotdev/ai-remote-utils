@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -69,8 +70,57 @@ func TestDefaultCertDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := filepath.Join(home, ".tmp-file")
+	expected := filepath.Join(home, ".ai-remote-utils")
 	if dir != expected {
 		t.Errorf("expected %s, got %s", expected, dir)
+	}
+}
+
+func TestGenerateServiceFile_ContainsBinPath(t *testing.T) {
+	content := GenerateServiceFile("/usr/local/bin/ai-remote-utils", "/usr/local/share/ai-remote-utils")
+	if !strings.Contains(content, "/usr/local/bin/ai-remote-utils") {
+		t.Error("service file missing ExecStart path")
+	}
+	if !strings.Contains(content, "/usr/local/share/ai-remote-utils") {
+		t.Error("service file missing WorkingDirectory")
+	}
+}
+
+func TestGenerateServiceFile_HasRequiredKeys(t *testing.T) {
+	content := GenerateServiceFile("/usr/local/bin/ai-remote-utils", "/usr/local/share/ai-remote-utils")
+	required := []string{"[Unit]", "Description=", "After=network.target", "[Service]",
+		"ExecStart=", "WorkingDirectory=", "Restart=on-failure", "[Install]", "WantedBy="}
+	for _, key := range required {
+		if !strings.Contains(content, key) {
+			t.Errorf("service file missing %q", key)
+		}
+	}
+}
+
+func TestInstallService_WritesToTargetDir(t *testing.T) {
+	targetDir := t.TempDir()
+	err := InstallService("/usr/local/bin/ai-remote-utils", "/usr/local/share/ai-remote-utils", targetDir)
+	if err != nil {
+		t.Fatalf("InstallService error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(targetDir, "ai-remote-utils.service"))
+	if err != nil {
+		t.Fatalf("failed to read service file: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "/usr/local/bin/ai-remote-utils") {
+		t.Error("written file missing ExecStart")
+	}
+}
+
+func TestInstallService_CreatesDir(t *testing.T) {
+	// Target parent dir doesn't exist — should be created
+	targetDir := filepath.Join(t.TempDir(), "nonexistent", "subdir")
+	err := InstallService("/test/bin", "/test/share", targetDir)
+	if err != nil {
+		t.Fatalf("InstallService error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(targetDir, "ai-remote-utils.service")); os.IsNotExist(err) {
+		t.Error("service file was not created")
 	}
 }

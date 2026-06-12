@@ -39,8 +39,8 @@ func generateCertWithValidity(validity time.Duration) (certPEM, keyPEM []byte, e
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization: []string{"tmp-file"},
-			CommonName:   "tmp-file",
+			Organization: []string{"ai-remote-utils"},
+			CommonName:   "ai-remote-utils",
 		},
 		NotBefore:             now,
 		NotAfter:              now.Add(validity),
@@ -48,7 +48,7 @@ func generateCertWithValidity(validity time.Duration) (certPEM, keyPEM []byte, e
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		IPAddresses:           []net.IP{net.ParseIP("0.0.0.0")},
-		DNSNames:              []string{"localhost"},
+		DNSNames:              []string{"localhost", "*.test", "tmp.test"},
 	}
 
 	// Create self-signed certificate
@@ -102,8 +102,32 @@ func CertExpiresSoon(certPEM []byte, within time.Duration) bool {
 	return time.Now().Add(within).After(cert.NotAfter)
 }
 
+// certHasSANs checks if a PEM-encoded certificate contains all the required DNS SANs.
+func certHasSANs(certPEM []byte, required []string) bool {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return false
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+
+	sanSet := make(map[string]bool, len(cert.DNSNames))
+	for _, name := range cert.DNSNames {
+		sanSet[name] = true
+	}
+
+	for _, required := range required {
+		if !sanSet[required] {
+			return false
+		}
+	}
+	return true
+}
+
 // EnsureCert ensures the certificate exists at certDir, generating if needed.
-// If the existing cert is expired, it regenerates. Default certDir is ~/.tmp-file/.
+// If the existing cert is expired or missing required SANs, it regenerates.
 func EnsureCert(certDir string) error {
 	// Create cert directory if needed
 	if err := os.MkdirAll(certDir, 0700); err != nil {
@@ -113,22 +137,28 @@ func EnsureCert(certDir string) error {
 	certPath := filepath.Join(certDir, "cert.pem")
 	keyPath := filepath.Join(certDir, "key.pem")
 
+	requiredSANs := []string{"*.test", "tmp.test", "localhost"}
+
 	// Check if both files exist and cert is valid
 	if existingCert, err := os.ReadFile(certPath); err == nil {
 		if _, err := os.ReadFile(keyPath); err == nil {
 			if !CertIsExpired(existingCert) {
-				// Cert is valid — reuse
-				slog.Debug("reusing existing certificate", "path", certPath)
-				return nil
+				// Check if cert has required SANs
+				if certHasSANs(existingCert, requiredSANs) {
+					slog.Debug("reusing existing certificate", "path", certPath)
+					return nil
+				}
+				slog.Info("certificate missing required SANs, regenerating", "path", certPath)
+				os.Remove(certPath)
+				os.Remove(keyPath)
+			} else {
+				slog.Info("certificate expired, regenerating", "path", certPath)
+				if CertExpiresSoon(existingCert, 30*24*time.Hour) {
+					slog.Warn("certificate expires within 30 days", "path", certPath)
+				}
+				os.Remove(certPath)
+				os.Remove(keyPath)
 			}
-			slog.Info("certificate expired, regenerating", "path", certPath)
-			// Check if it's expiring soon and log warning
-			if CertExpiresSoon(existingCert, 30*24*time.Hour) {
-				slog.Warn("certificate expires within 30 days", "path", certPath)
-			}
-			// Remove expired files so we can regenerate
-			os.Remove(certPath)
-			os.Remove(keyPath)
 		}
 	}
 

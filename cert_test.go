@@ -41,6 +41,40 @@ func TestGenerateCert_ValidCert(t *testing.T) {
 	}
 }
 
+func TestGenerateCert_ContainsWildcardSANs(t *testing.T) {
+	certPEM, _, err := GenerateCert()
+	if err != nil {
+		t.Fatalf("GenerateCert() error = %v", err)
+	}
+
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		t.Fatal("failed to decode cert PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("x509.ParseCertificate error = %v", err)
+	}
+
+	// Check for required DNS SANs
+	sanMap := make(map[string]bool)
+	for _, dnsName := range cert.DNSNames {
+		sanMap[dnsName] = true
+	}
+
+	required := []string{"localhost", "*.test", "tmp.test"}
+	for _, name := range required {
+		if !sanMap[name] {
+			t.Errorf("cert missing DNS SAN %q; got %v", name, cert.DNSNames)
+		}
+	}
+
+	// Should have IP SAN for 0.0.0.0
+	if len(cert.IPAddresses) == 0 {
+		t.Error("cert has no IP SANs")
+	}
+}
+
 func TestGenerateCert_KeyPairMatch(t *testing.T) {
 	certPEM, keyPEM, err := GenerateCert()
 	if err != nil {

@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>tmp-file upload</title>
+    <style>
+      :root {
+        --bg: #0f1117;
+        --surface: #1a1d28;
+        --surface-hover: #222639;
+        --border: #2a2e3e;
+        --border-active: #22d3ee;
+        --text: #e2e8f0;
+        --text-dim: #94a3b8;
+        --accent: #22d3ee;
+        --accent-dim: #155e75;
+        --success: #22c55e;
+        --error: #ef4444;
+        --radius: 12px;
+        --radius-sm: 8px;
+      }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 2rem 1rem;
+        line-height: 1.5;
+      }
+
+      .container {
+        width: 100%;
+        max-width: 640px;
+      }
+
+      h1 {
+        font-size: 1.75rem;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        margin-bottom: 0.25rem;
+      }
+
+      .subtitle {
+        color: var(--text-dim);
+        font-size: 0.875rem;
+        margin-bottom: 2rem;
+      }
+
+      /* Dropzone */
+      .dropzone {
+        position: relative;
+        border: 2px dashed var(--border);
+        border-radius: var(--radius);
+        padding: 3rem 2rem;
+        text-align: center;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        background: var(--surface);
+        margin-bottom: 1rem;
+      }
+
+      .dropzone:hover {
+        border-color: var(--accent-dim);
+        background: var(--surface-hover);
+      }
+
+      .dropzone.drag-over {
+        border-color: var(--accent);
+        background: rgba(34, 211, 238, 0.06);
+        transform: scale(1.01);
+        box-shadow: 0 0 30px rgba(34, 211, 238, 0.08);
+      }
+
+      .dropzone-icon {
+        font-size: 2.5rem;
+        margin-bottom: 0.75rem;
+        opacity: 0.6;
+      }
+
+      .dropzone-text {
+        font-size: 0.95rem;
+        color: var(--text-dim);
+      }
+
+      .dropzone-text strong {
+        color: var(--accent);
+        font-weight: 600;
+      }
+
+      .dropzone-hint {
+        font-size: 0.8rem;
+        color: var(--text-dim);
+        margin-top: 0.5rem;
+        opacity: 0.7;
+      }
+
+      #file-input {
+        display: none;
+      }
+
+      .upload-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.625rem 1.5rem;
+        background: var(--accent);
+        color: #0f1117;
+        border: none;
+        border-radius: var(--radius-sm);
+        font-size: 0.9rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: opacity 0.15s ease;
+      }
+
+      .upload-btn:hover {
+        opacity: 0.85;
+      }
+
+      .upload-btn:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+
+      /* Progress / Status */
+      #status {
+        margin-top: 1rem;
+        display: none;
+      }
+
+      #status.show {
+        display: block;
+      }
+
+      .status-uploading {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 1rem;
+        background: var(--surface);
+        border-radius: var(--radius-sm);
+        font-size: 0.9rem;
+        color: var(--text-dim);
+      }
+
+      .spinner {
+        width: 18px;
+        height: 18px;
+        border: 2px solid var(--border);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      .status-error {
+        padding: 0.875rem 1rem;
+        background: rgba(239, 68, 68, 0.1);
+        border: 1px solid rgba(239, 68, 68, 0.25);
+        border-radius: var(--radius-sm);
+        color: var(--error);
+        font-size: 0.9rem;
+      }
+
+      /* Result cards */
+      #results {
+        margin-top: 1rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+      }
+
+      .result-card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 1rem;
+        display: flex;
+        gap: 1rem;
+        align-items: flex-start;
+        animation: card-in 0.25s ease;
+      }
+
+      @keyframes card-in {
+        from {
+          opacity: 0;
+          transform: translateY(8px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      .result-preview {
+        flex-shrink: 0;
+        width: 56px;
+        height: 56px;
+        border-radius: var(--radius-sm);
+        object-fit: cover;
+        background: var(--surface-hover);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.5rem;
+      }
+
+      .result-body {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .result-filename {
+        font-size: 0.85rem;
+        font-weight: 600;
+        margin-bottom: 0.375rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .result-path-row {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+      }
+
+      .result-path {
+        flex: 1;
+        min-width: 0;
+        padding: 0.5rem 0.75rem;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        color: var(--accent);
+        font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+        font-size: 0.8rem;
+        outline: none;
+        cursor: default;
+      }
+
+      .copy-btn {
+        flex-shrink: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 34px;
+        height: 34px;
+        background: var(--surface-hover);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        color: var(--text-dim);
+        cursor: pointer;
+        font-size: 0.9rem;
+        transition: all 0.15s ease;
+      }
+
+      .copy-btn:hover {
+        color: var(--accent);
+        border-color: var(--accent-dim);
+      }
+
+      .copy-btn.copied {
+        color: var(--success);
+        border-color: var(--success);
+      }
+
+      /* Toast for clipboard */
+      .toast {
+        position: fixed;
+        bottom: 2rem;
+        left: 50%;
+        transform: translateX(-50%) translateY(100px);
+        background: var(--success);
+        color: #0f1117;
+        padding: 0.625rem 1.25rem;
+        border-radius: var(--radius-sm);
+        font-size: 0.85rem;
+        font-weight: 600;
+        opacity: 0;
+        transition: all 0.25s ease;
+        pointer-events: none;
+      }
+
+      .toast.show {
+        opacity: 1;
+        transform: translateX(-50%) translateY(0);
+      }
+
+      @media (max-width: 480px) {
+        body {
+          padding: 1rem;
+        }
+        .dropzone {
+          padding: 2rem 1rem;
+        }
+        .result-card {
+          flex-direction: column;
+        }
+        .result-preview {
+          width: 100%;
+          height: 120px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>tmp-file</h1>
+      <p class="subtitle">Upload files to your AI agent</p>
+
+      <!-- Dropzone -->
+      <div class="dropzone" id="dropzone">
+        <div class="dropzone-icon">&#128206;</div>
+        <div class="dropzone-text">
+          <strong>Click</strong> to select or <strong>drag</strong> files here
+        </div>
+        <div class="dropzone-hint">or paste an image from clipboard</div>
+        <input type="file" id="file-input" multiple />
+      </div>
+
+      <!-- Hidden upload button for explicit upload -->
+      <button class="upload-btn" id="upload-btn" disabled>
+        <span>Upload</span> <span id="file-count"></span>
+      </button>
+
+      <!-- Status area -->
+      <div id="status"></div>
+
+      <!-- Results -->
+      <div id="results"></div>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast" id="toast">Copied to clipboard</div>
+
+    <script>
+      (function () {
+        const dropzone = document.getElementById("dropzone");
+        const fileInput = document.getElementById("file-input");
+        const uploadBtn = document.getElementById("upload-btn");
+        const statusEl = document.getElementById("status");
+        const resultsEl = document.getElementById("results");
+        const toastEl = document.getElementById("toast");
+        const fileCount = document.getElementById("file-count");
+
+        let selectedFiles = [];
+
+        // --- Toast ---
+        function showToast(msg) {
+          toastEl.textContent = msg;
+          toastEl.classList.add("show");
+          setTimeout(() => toastEl.classList.remove("show"), 2000);
+        }
+
+        // --- Files selected (staging only) ---
+        function filesSelected(files) {
+          selectedFiles = Array.from(files);
+          if (selectedFiles.length > 0) {
+            uploadBtn.disabled = false;
+            fileCount.textContent = `(${selectedFiles.length} file${selectedFiles.length > 1 ? "s" : ""})`;
+          } else {
+            uploadBtn.disabled = true;
+            fileCount.textContent = "";
+          }
+        }
+
+        // --- Click to select (staging only — requires explicit Upload click) ---
+        dropzone.addEventListener("click", () => fileInput.click());
+        fileInput.addEventListener("change", (e) =>
+          filesSelected(e.target.files),
+        );
+
+        // --- Drag and drop (auto-upload) ---
+        dropzone.addEventListener("dragover", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          dropzone.classList.add("drag-over");
+        });
+
+        dropzone.addEventListener("dragleave", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          dropzone.classList.remove("drag-over");
+        });
+
+        dropzone.addEventListener("drop", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          dropzone.classList.remove("drag-over");
+          if (e.dataTransfer.files.length > 0) {
+            filesSelected(e.dataTransfer.files);
+            uploadFiles(selectedFiles);
+          }
+        });
+
+        // --- Paste from clipboard (auto-upload) ---
+        document.addEventListener("paste", async (e) => {
+          const items = e.clipboardData?.items;
+          if (!items) return;
+
+          for (const item of items) {
+            if (item.type.startsWith("image/")) {
+              const file = item.getAsFile();
+              if (file) {
+                filesSelected([file]);
+                uploadFiles([file]);
+              }
+              break;
+            }
+          }
+        });
+
+        // --- Upload ---
+        async function uploadFiles(files) {
+          if (files.length === 0) return;
+
+          statusEl.innerHTML =
+            '<div class="status-uploading"><div class="spinner"></div>Uploading...</div>';
+          statusEl.classList.add("show");
+
+          const formData = new FormData();
+          for (const file of files) {
+            formData.append("files", file);
+          }
+
+          try {
+            const response = await fetch("/upload", {
+              method: "POST",
+              body: formData,
+            });
+
+            const data = await response.json();
+            statusEl.classList.remove("show");
+
+            if (!response.ok) {
+              showError(data.error || `Server error (${response.status})`);
+              return;
+            }
+
+            // Show result cards for each uploaded file
+            const resultPaths = data.paths || [data.path];
+            for (
+              let i = 0;
+              i < Math.min(files.length, resultPaths.length);
+              i++
+            ) {
+              addResultCard(files[i], resultPaths[i]);
+            }
+
+            // Clear selection
+            selectedFiles = [];
+            uploadBtn.disabled = true;
+            fileCount.textContent = "";
+            fileInput.value = "";
+          } catch (err) {
+            statusEl.classList.remove("show");
+            showError("Network error: " + err.message);
+          }
+        }
+
+        function showError(msg) {
+          statusEl.innerHTML = `<div class="status-error">${escapeHtml(msg)}</div>`;
+          statusEl.classList.add("show");
+          setTimeout(() => statusEl.classList.remove("show"), 5000);
+        }
+
+        function addResultCard(file, path) {
+          const card = document.createElement("div");
+          card.className = "result-card";
+
+          const isImage = file.type.startsWith("image/");
+          const previewHtml = isImage
+            ? `<img class="result-preview" src="${URL.createObjectURL(file)}" alt="preview">`
+            : `<div class="result-preview">&#128196;</div>`;
+
+          card.innerHTML = `
+      ${previewHtml}
+      <div class="result-body">
+        <div class="result-filename">${escapeHtml(file.name)}</div>
+        <div class="result-path-row">
+          <input class="result-path" type="text" value="${escapeHtml(path)}" readonly onclick="this.select()">
+          <button class="copy-btn" data-path="${escapeHtml(path)}" title="Copy path">&#128203;</button>
+        </div>
+      </div>
+    `;
+
+          // Copy button handler
+          const copyBtn = card.querySelector(".copy-btn");
+          copyBtn.addEventListener("click", async () => {
+            try {
+              await navigator.clipboard.writeText(copyBtn.dataset.path);
+              copyBtn.classList.add("copied");
+              showToast("Copied to clipboard");
+              setTimeout(() => copyBtn.classList.remove("copied"), 1500);
+            } catch {
+              // Fallback: select the text
+              const input = card.querySelector(".result-path");
+              input.select();
+              input.setSelectionRange(0, 99999);
+              showToast("Select the path and copy manually (Ctrl+C)");
+            }
+          });
+
+          resultsEl.prepend(card);
+        }
+
+        function escapeHtml(str) {
+          const div = document.createElement("div");
+          div.textContent = str;
+          return div.innerHTML;
+        }
+
+        // Upload button click (for staged files)
+        uploadBtn.addEventListener("click", () => {
+          if (selectedFiles.length > 0) {
+            uploadFiles(selectedFiles);
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>

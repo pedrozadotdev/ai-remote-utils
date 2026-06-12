@@ -1,0 +1,6 @@
+.context/
+/docs/plans/
+/docs/reviews/
+/docs/brainstorms/
+tmp-file
+coverage.out

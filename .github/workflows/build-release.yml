@@ -7,7 +7,6 @@ on:
 jobs:
   releases-matrix:
     name: Release Go Binary
-    runs-on: self-hosted
     strategy:
       matrix:
         goos: [linux]

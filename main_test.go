@@ -70,7 +70,7 @@ func TestDefaultCertDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := filepath.Join(home, ".ai-remote-utils")
+	expected := filepath.Join(home, ".aru")
 	if dir != expected {
 		t.Errorf("expected %s, got %s", expected, dir)
 	}

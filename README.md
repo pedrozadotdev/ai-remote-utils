@@ -5,6 +5,7 @@ A single Go binary that provides local development utilities for AI agent workfl
 - **Reverse proxy** — access any `localhost:<port>` via named `https://<name>.test` URLs, managed via CLI
 - **File upload** — drag-drop/paste file upload with `@`-prefixed path for AI agents
 - **Built-in DNS** — automatically resolves `*.test` domains to your machine's IP (zero-config)
+- **Worktree manager** — create/remove/open/list git worktrees with tmux sessions and RAM-backed data
 - **Auto-cleanup** — uploaded files clean up after 1 hour
 - **No dependencies** — uses only Go standard library
 
@@ -41,7 +42,7 @@ ai-remote-utils proxy list
 ai-remote-utils proxy del --name=myapp
 ```
 
-- Proxy entries are persisted in `~/.ai-remote-utils/proxies.json` (survives restarts)
+- Proxy entries are persisted in `~/.aru/proxies.json` (survives restarts)
 - Edits to `proxies.json` are picked up at runtime (hot-reload via mtime check)
 - WebSocket support works automatically (Vite, Next.js hot-reload)
 - Host header is preserved as `*.test` (upstream sees the original hostname)
@@ -65,6 +66,31 @@ The built-in DNS server automatically resolves `*.test` domains to your machine'
 - Non-`.test` queries → NXDOMAIN (not an open resolver)
 
 If port 53 is already in use (e.g., `systemd-resolved`), the server logs a warning and continues without DNS — use `/etc/hosts` as fallback.
+
+### 🔧 Worktree manager
+
+Create isolated git worktrees with tmux sessions and RAM-backed data directories:
+
+```bash
+# Add a worktree for a feature branch (pulls latest, creates worktree, launches tmux)
+ai-remote-utils worktree add my-feature
+
+# Re-attach to an existing worktree's tmux session
+ai-remote-utils worktree open my-feature
+
+# Remove a worktree (cleans up RAM, kills tmux, deletes branch)
+ai-remote-utils worktree del my-feature
+
+# List all worktrees with current directory marker
+ai-remote-utils worktree list
+```
+
+- Worktrees stored at `~/.aru/wt/<project>/<branch>`
+- RAM-backed data at `~/.aru/ram/<project>/<branch>` (tmpfs via `syscall.Mount`)
+- Data directory symlinked to `<worktree>/data` → RAM directory
+- Tmux sessions managed via custom sockets at `~/.aru/sockets/<project>-<branch>.sock`
+- Lifecycle hooks: `wt-setup.sh` (runs in tmux setup window with `PORT` env var), `wt-destroy.sh` (runs on deletion)
+- RAM directory and symlink auto-recreated on `open` if missing (handle reboots)
 
 ### 🔄 Auto-redirect (port 80 → 443)
 
@@ -91,16 +117,16 @@ echo "127.0.0.1 tmp.test 3000.test 8080.test" | sudo tee -a /etc/hosts
 |------|---------|---------|-------------|
 | `-port` | `443` | `PORT` | HTTPS server port |
 | `-max-size` | `52428800` (50 MB) | `MAX_UPLOAD_SIZE` | Maximum upload file size in bytes |
-| `-cert-dir` | `~/.ai-remote-utils/` | `CERT_DIR` | Directory for TLS certificates and proxy DB |
+| `-cert-dir` | `~/.aru/` | `CERT_DIR` | Directory for TLS certificates and proxy DB |
 | `-upload-dir` | `/tmp/u` | `UPLOAD_DIR` | Upload directory |
 | `--install-service` | `false` | — | Install systemd service and exit (no other flags needed) |
 
-### Proxy management subcommands
+### Subcommands
 
 Manage reverse proxy entries without restarting the server:
 
 ```bash
-# Add a named proxy (persisted to ~/.ai-remote-utils/proxies.json)
+# Add a named proxy (persisted to ~/.aru/proxies.json)
 ai-remote-utils proxy add --name=myapp --port=3000
 
 # Delete a proxy
@@ -108,6 +134,12 @@ ai-remote-utils proxy del --name=myapp
 
 # List all proxies
 ai-remote-utils proxy list
+
+# Worktree management
+ai-remote-utils worktree add my-feature
+ai-remote-utils worktree open my-feature
+ai-remote-utils worktree del my-feature
+ai-remote-utils worktree list
 ```
 
 Flags override environment variables. Environment variables override defaults.
@@ -147,17 +179,32 @@ Response (multiple files):
 ## Architecture
 
 ```
-main.go         — entry point, three listeners (DNS :53, HTTP redirect :80, HTTPS :443)
+main.go         — entry point, subcommand routing (proxy, worktree), three listeners
 server.go       — virtual host routing (tmp.test → upload, <name>.test → proxy via ProxyDB)
 proxy.go        — reverse proxy handler with WebSocket support, LookupProxy
 proxydb.go      — persistent proxy database (JSON-backed, thread-safe, hot-reload)
+worktree.go     — git worktree manager (add/del/open/list), RAM dir, tmux sessions
+cert.go         — self-signed TLS certificate with wildcard SANs (*.test, tmp.test)
 dns.go          — built-in DNS server for *.test domains
 redirect.go     — HTTP → HTTPS redirect server
 upload.go       — file upload handler, name generation
 cleanup.go      — background file cleanup goroutine
-cert.go         — self-signed TLS certificate with wildcard SANs (*.test, tmp.test)
 static.go       — embedded static files (frontend)
 static/         — frontend HTML/CSS/JS assets
+```
+
+### Data directory
+
+All persistent data lives under `~/.aru/`:
+
+```
+~/.aru/
+├── cert.pem          — TLS certificate
+├── key.pem           — TLS private key (0600)
+├── proxies.json      — Reverse proxy configuration
+├── wt/               — Git worktrees (<project>/<branch>)
+├── ram/              — RAM-backed data (tmpfs, <project>/<branch>)
+└── sockets/          — Tmux control sockets (<project>-<branch>.sock)
 ```
 
 ### Listeners

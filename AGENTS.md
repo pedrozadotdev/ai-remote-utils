@@ -14,6 +14,8 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 | Change reverse proxy | `proxy.go` — `LookupProxy`, `NewReverseProxy`; `proxy_test.go` |
 | Change proxy persistence | `proxydb.go` — ProxyDB (Load/Save/Add/Delete/Get/List/Refresh); `proxydb_test.go` |
 | Change proxy management CLI | `main.go` — `handleProxySubcommand`, `handleProxyAdd`, `handleProxyDel`, `handleProxyList` |
+| Change worktree behavior | `worktree.go` — `handleWorktreeAdd`, `handleWorktreeDel`, `handleWorktreeOpen`, `handleWorktreeList`; `worktree_test.go` |
+| Add worktree subcommand | `main.go` — add `"worktree"` case to subcommand switch alongside `"proxy"` |
 | Change HTTP redirect | `redirect.go` — `StartRedirect`; `redirect_test.go` |
 | Add/change routes or middleware | `server.go` — `NewServer` virtual host mux; `server_test.go` |
 | Change main.go wiring | `main.go` — flag parsing, listener orchestration, signal handling |
@@ -21,6 +23,7 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 | Add embedded static asset | `static.go` — embed via `//go:embed static` directive |
 | Change systemd service | `ai-remote-utils.service` — unit file |
 | Document a solved problem | `~/.pi/agent/docs/solutions/<category>/` (global solutions) |
+| Mock external commands in tests | `docs/solutions/go-mock-external-commands-testing.md` — PATH manipulation with mock binaries, temp git repos |
 | Review code changes | `docs/reviews/<date>-<topic>.md` using `04-review` skill |
 
 ## Core Rules & Conventions
@@ -36,6 +39,7 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 - Single `package main` — all source files are in one package
 - No init() functions unless absolutely necessary
 - Embedded static files via `//go:embed static/index.html`
+- Worktree operations use `os/exec` for git and tmux, `syscall.Mount` for tmpfs
 
 ### Testing conventions
 - All test files: `*_test.go` in same package
@@ -58,6 +62,17 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 - Extension preserved from original filename, fallback `.bin`
 - Mutex-protected name generation with collision retry (max 10)
 
+### Worktree conventions
+- Worktree operations require a git repository (checked via `git rev-parse --git-dir`)
+- Must be run from the main (non-linked) worktree root — checked via `git rev-parse --git-common-dir` vs `--git-dir`
+- Worktrees stored at `~/.aru/wt/<project>/<branch>`
+- RAM-backed data at `~/.aru/ram/<project>/<branch>` with tmpfs via `syscall.Mount` (falls back to regular dir if mount fails)
+- Tmux sessions use custom sockets at `~/.aru/sockets/<project>-<branch>.sock`
+- Lifecycle scripts: `wt-setup.sh` (runs in tmux setup window with PORT env) and `wt-destroy.sh` (runs on worktree deletion)
+- `setupTmuxSession` returns errors instead of calling `os.Exit` — callers handle fallback
+- Port discovery scans 1024-9999 via `net.Listen` (TOCTOU accepted — port only used for env var)
+- Missing tmux = hard error; missing git = hard error
+
 ### Reverse proxy conventions
 - `LookupProxy` extracts subdomain from `<name>.test` hostnames, looks up name in ProxyDB
 - Case-insensitive matching
@@ -78,6 +93,10 @@ When these code patterns appear in a diff, flag for review:
 - DNS responses for non-`.test` domains that return data (ensure REFUSED is not accidentally changed to success or NXDOMAIN)
 - `blockedProxyPorts` bypass via JSON file edit (LoadProxyDB and Refresh must validate ports)
 - ProxyDB name validation bypass — `LookupProxy` must block reserved names (`tmp`, `test`) alongside `validateName`
+- `os.Exit()` inside functions called from goroutines (cannot be recovered)
+- `waitForSocket` using `os.Stat` instead of actual readiness check (`tmux has-session`)
+- `runSetupScript` called from both foreground and tmux window (double execution)
+- `setupTmuxSession` calling `os.Exit` instead of returning errors
 
 ## Pipeline Workflow
 
@@ -94,6 +113,7 @@ When developing this project, sequence through:
 
 Project-specific solutions at `docs/solutions/`:
 - `go-json-persistent-store-proxydb-pattern.md` — Go JSON-backed persistent store with write-through, mtime hot-reload, thread safety
+- `go-mock-external-commands-testing.md` — Mocking external commands in Go tests using PATH manipulation
 
 Global solutions at `~/.pi/agent/docs/solutions/`:
 - `architecture/go-tls-key-permissions.md` — private key 0600 rule

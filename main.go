@@ -25,10 +25,16 @@ const (
 )
 
 func main() {
-	// Check for proxy subcommand before parsing server flags
-	if len(os.Args) > 1 && os.Args[1] == "proxy" {
-		handleProxySubcommand(os.Args[2:])
-		return
+	// Check for subcommands before parsing server flags
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "proxy":
+			handleProxySubcommand(os.Args[2:])
+			return
+		case "worktree":
+			handleWorktreeSubcommand(os.Args[2:])
+			return
+		}
 	}
 
 	// --- Flag parsing ---
@@ -314,9 +320,9 @@ func lookupEnvStr(key, fallback string) string {
 func defaultCertDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ".ai-remote-utils"
+		return ".aru"
 	}
-	return filepath.Join(home, ".ai-remote-utils")
+	return filepath.Join(home, ".aru")
 }
 
 // defaultUploadDir returns the default upload directory.

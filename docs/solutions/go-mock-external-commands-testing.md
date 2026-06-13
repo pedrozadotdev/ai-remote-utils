@@ -226,4 +226,6 @@ func TestHandleWorktreeAdd(t *testing.T) {
 
 ## See also
 
-- `docs/solutions/go-json-persistent-store-proxydb-pattern.md` — Thread-safe JSON persistence (uses similar test patterns)
+- `go-json-persistent-store-proxydb-pattern.md` — Thread-safe JSON persistence (uses similar test patterns)
+- `go-recording-mock-binary-testing.md` — Recording mock binary that logs invocations to a JSONL file for argument verification
+- `go-struct-walking-placeholder-resolution.md` — Struct-walking placeholder resolution (alternative to marshal-replace-unmarshal)

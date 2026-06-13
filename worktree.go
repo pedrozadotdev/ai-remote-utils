@@ -1,12 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -159,6 +162,12 @@ func baseDir() string {
 	return filepath.Join(home, ".aru")
 }
 
+// stateDir returns the per-worktree state directory (~/.aru/state/<project>/<branch>).
+// Used for persisting runtime data (e.g., allocated ports) so it survives reboots.
+func stateDir(project, branch string) string {
+	return filepath.Join(baseDir(), "state", project, branch)
+}
+
 // worktreeDir returns the worktree path for the given project and branch.
 func worktreeDir(project, branch string) string {
 	return filepath.Join(baseDir(), "wt", project, branch)
@@ -301,13 +310,23 @@ func unmountRamDir(path string) error {
 }
 
 // setupDataSymlink creates a symlink at <target>/data pointing to ramPath.
-// If the symlink already exists, it is replaced.
+// If a symlink already exists, it is replaced. If <target>/data exists as a
+// non-symlink (e.g., a real directory with user content), the function logs
+// a warning and skips symlink creation to avoid destroying user data.
 func setupDataSymlink(target, ramPath string) error {
 	linkPath := filepath.Join(target, "data")
 
-	// Remove existing symlink or directory
-	if err := os.RemoveAll(linkPath); err != nil {
-		return fmt.Errorf("worktree: failed to remove existing data path %s: %w", linkPath, err)
+	// Check what's there before touching it
+	if fi, err := os.Lstat(linkPath); err == nil {
+		if fi.Mode()&os.ModeSymlink == 0 {
+			// Existing path is a real directory or file — don't destroy user data
+			slog.Warn("data path exists and is not a symlink; skipping symlink creation to preserve contents", "path", linkPath)
+			return nil
+		}
+		// Existing symlink — remove it before recreating
+		if err := os.Remove(linkPath); err != nil {
+			return fmt.Errorf("worktree: failed to remove existing symlink %s: %w", linkPath, err)
+		}
 	}
 
 	if err := os.Symlink(ramPath, linkPath); err != nil {
@@ -330,48 +349,428 @@ func removeDataSymlink(target string) error {
 	return nil
 }
 
-// ── Lifecycle script helpers ────────────────────────────────────────────
+// ── Config-based lifecycle helpers ───────────────────────────────────────
 
-// runDestroyScript runs wt-destroy.sh in the given directory if it exists.
-func runDestroyScript(target string) {
-	scriptPath := filepath.Join(target, "wt-destroy.sh")
-	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
-		return
-	}
+// TRUST MODEL: All commands in aru.json (setup, teardown, tmux windows) run
+// as the user invoking `aru`. The user already has full shell access, so the
+// commands are equivalent to typing them in a terminal — no privilege
+// escalation occurs. This is the same trust model as Makefile recipes,
+// package.json scripts, or Dockerfile RUN instructions.
+//
+// Implications:
+//   - Anyone who can write to aru.json can execute commands as the user.
+//   - Review aru.json changes in pull requests with the same care as shell scripts.
+//   - If you copy aru.json from an untrusted source, treat it as code execution.
+//   - There is no in-process sandbox; commands run with full user permissions.
 
-	slog.Info("running wt-destroy.sh", "dir", target)
-	cmd := exec.Command("bash", scriptPath)
-	cmd.Dir = target
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		slog.Warn("wt-destroy.sh returned an error", "error", err)
+// runSetupCommands runs each setup command in order with bash -c.
+// If a command fails, a warning is logged but execution continues.
+//
+// Commands are run verbatim from the user's aru.json. See the TRUST MODEL
+// comment above for security implications.
+func runSetupCommands(target string, commands []string) {
+	for _, cmdStr := range commands {
+		slog.Info("running setup command", "dir", target, "command", cmdStr)
+		cmd := exec.Command("bash", "-c", cmdStr)
+		cmd.Dir = target
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			slog.Warn("setup command failed", "command", cmdStr, "error", err)
+		}
 	}
 }
 
-// runSetupScript runs wt-setup.sh in the given directory with the PORT env var if it exists.
-func runSetupScript(target, port string) {
-	scriptPath := filepath.Join(target, "wt-setup.sh")
-	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+// runTeardownCommands runs each teardown command in order with bash -c.
+// If a command fails, a warning is logged but execution continues.
+//
+// Commands are run verbatim from the user's aru.json. See the TRUST MODEL
+// comment above for security implications.
+func runTeardownCommands(target string, commands []string) {
+	for _, cmdStr := range commands {
+		slog.Info("running teardown command", "dir", target, "command", cmdStr)
+		cmd := exec.Command("bash", "-c", cmdStr)
+		cmd.Dir = target
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			slog.Warn("teardown command failed", "command", cmdStr, "error", err)
+		}
+	}
+}
+
+// runSetupIfNeeded runs setup commands unless setup_oneshot is true and the
+// setup-complete marker already exists for this worktree. If setup_oneshot is
+// true and the marker is missing, runs setup and writes the marker on success.
+//
+// Note: runSetupCommands already logs warnings on per-command failure but
+// continues. The marker is written after the loop runs (we don't track per-
+// command success — the trust model is "if user ran the setup, it succeeded
+// from their perspective"). To force re-run, delete the marker file.
+func runSetupIfNeeded(project, branch, target string, resolved *ResolvedConfig) {
+	if resolved == nil || len(resolved.Setup) == 0 {
 		return
 	}
 
-	slog.Info("running wt-setup.sh", "dir", target, "port", port)
-	cmd := exec.Command("bash", scriptPath)
-	cmd.Dir = target
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), "PORT="+port)
-	if err := cmd.Run(); err != nil {
-		slog.Warn("wt-setup.sh returned an error", "error", err)
+	if resolved.SetupOneshot && isSetupComplete(project, branch) {
+		slog.Info("setup already complete, skipping (setup_oneshot=true)", "project", project, "branch", branch)
+		return
 	}
+
+	runSetupCommands(target, resolved.Setup)
+
+	if resolved.SetupOneshot {
+		if err := markSetupComplete(project, branch); err != nil {
+			slog.Warn("failed to mark setup complete, future opens may re-run", "error", err)
+		}
+	}
+}
+
+// buildTmuxCommand constructs a tmux command string from a TmuxWindow config.
+// Format: export K1=V1; export K2=V2; command; exec bash
+//
+// SECURITY: Env values are shell-escaped with strconv.Quote to prevent
+// injection via crafted env values (e.g., a value containing `; rm -rf /`).
+// The `command` field is NOT escaped — by design, per the TRUST MODEL: aru.json
+// is treated as trusted code, equivalent to Makefile recipes or npm scripts.
+// The user already has full shell access, so sandboxing commands would
+// provide no additional security. Review aru.json changes with the same
+// care as shell scripts.
+func buildTmuxCommand(win TmuxWindow) string {
+	var parts []string
+
+	// Sort env keys for deterministic output
+	if len(win.Env) > 0 {
+		keys := make([]string, 0, len(win.Env))
+		for k := range win.Env {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			parts = append(parts, fmt.Sprintf("export %s=%s", k, strconv.Quote(win.Env[k])))
+		}
+	}
+
+	if win.Command != "" {
+		parts = append(parts, win.Command)
+	}
+
+	parts = append(parts, "exec bash")
+	return strings.Join(parts, "; ")
+}
+
+// ── Port state persistence ───────────────────────────────────────────
+
+// portsStatePath returns the path to the persisted port assignments file.
+func portsStatePath(project, branch string) string {
+	return filepath.Join(stateDir(project, branch), "ports.json")
+}
+
+// portsStateFile is the JSON schema for the persisted port assignments.
+// Keys are placeholder numbers as strings (e.g., "1", "2") so the file
+// is human-readable and stable across Go map iteration order.
+type portsStateFile struct {
+	Ports map[string]int `json:"ports"`
+}
+
+// persistAllocatedPorts saves the port assignments to the state file so
+// subsequent `aru worktree open` calls can re-use the same ports.
+// Returns nil (no-op) if the ports map is empty.
+func persistAllocatedPorts(project, branch string, ports map[int]int) error {
+	if len(ports) == 0 {
+		return nil
+	}
+	path := portsStatePath(project, branch)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("worktree: failed to create state directory: %w", err)
+	}
+
+	state := portsStateFile{Ports: make(map[string]int, len(ports))}
+	for num, port := range ports {
+		state.Ports[strconv.Itoa(num)] = port
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("worktree: failed to marshal ports state: %w", err)
+	}
+	// 0600 — not secret, but per the principle of least privilege for state files
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return fmt.Errorf("worktree: failed to write ports state file: %w", err)
+	}
+	return nil
+}
+
+// loadAllocatedPorts reads the port assignments from the state file.
+// Returns (nil, nil) if the file does not exist (no warning — normal first-time case).
+// Returns (nil, error) if the file exists but cannot be parsed.
+func loadAllocatedPorts(project, branch string) (map[int]int, error) {
+	path := portsStatePath(project, branch)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("worktree: failed to read ports state: %w", err)
+	}
+
+	var state portsStateFile
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("worktree: failed to parse ports state: %w", err)
+	}
+
+	ports := make(map[int]int, len(state.Ports))
+	for numStr, port := range state.Ports {
+		num, err := strconv.Atoi(numStr)
+		if err != nil {
+			slog.Warn("skipping invalid port placeholder in state file", "key", numStr, "error", err)
+			continue
+		}
+		ports[num] = port
+	}
+	return ports, nil
+}
+
+// removeAllocatedPorts deletes the persisted port assignments file.
+// Best-effort: silently ignores "not found" errors.
+func removeAllocatedPorts(project, branch string) {
+	if err := os.Remove(portsStatePath(project, branch)); err != nil && !os.IsNotExist(err) {
+		slog.Debug("failed to remove ports state file", "error", err)
+	}
+}
+
+// ── Setup idempotency marker ────────────────────────────────────────────
+//
+// When aru.json sets `setup_oneshot: true`, setup commands run only once per
+// worktree session. After successful first-run, a marker file is written;
+// subsequent `aru worktree open` calls skip setup if the marker exists.
+// The marker is removed when the worktree is deleted.
+
+// setupCompletePath returns the path to the setup-complete marker file.
+func setupCompletePath(project, branch string) string {
+	return filepath.Join(stateDir(project, branch), "setup-complete")
+}
+
+// isSetupComplete reports whether the setup-complete marker exists for the
+// given worktree. Returns false on any error (treated as "not complete").
+func isSetupComplete(project, branch string) bool {
+	if _, err := os.Stat(setupCompletePath(project, branch)); err == nil {
+		return true
+	}
+	return false
+}
+
+// markSetupComplete writes the setup-complete marker file. Idempotent.
+func markSetupComplete(project, branch string) error {
+	path := setupCompletePath(project, branch)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("worktree: failed to create state directory: %w", err)
+	}
+	// 0600 — not secret, but least-privilege for state files
+	if err := os.WriteFile(path, []byte("complete"), 0600); err != nil {
+		return fmt.Errorf("worktree: failed to write setup-complete marker: %w", err)
+	}
+	return nil
+}
+
+// clearSetupComplete removes the setup-complete marker (best-effort).
+// Used during worktree deletion to clean up state.
+func clearSetupComplete(project, branch string) {
+	if err := os.Remove(setupCompletePath(project, branch)); err != nil && !os.IsNotExist(err) {
+		slog.Debug("failed to remove setup-complete marker", "error", err)
+	}
+}
+
+// portSource controls how port placeholders are resolved in readConfig.
+type portSource int
+
+const (
+	portSourceAllocate portSource = iota // allocate fresh ports (for `add`)
+	portSourceLoad                       // load from state file (for `open`)
+)
+
+// readConfig reads aru.json from the worktree, collects port placeholders,
+// and resolves them. Per source:
+//   - portSourceAllocate: allocates new ports, persists them to state file
+//   - portSourceLoad: loads ports from state file; falls back to allocation
+//     (with persistence) if state file is missing
+//
+// If project or branch is empty, warns and returns nil.
+// If aru.json is missing or malformed, warns and returns nil.
+func readConfig(target, project, branch string, source portSource) *ResolvedConfig {
+	if project == "" || branch == "" {
+		slog.Warn("project or branch is empty, skipping config resolution")
+		return nil
+	}
+
+	cfg, err := ParseAruConfig(target)
+	if err != nil {
+		slog.Warn("failed to parse aru.json", "error", err)
+		return nil
+	}
+	if cfg == nil {
+		slog.Warn("aru.json not found; create one to configure setup commands, tmux windows, and proxy")
+		return nil
+	}
+
+	placeholderNums := collectPortPlaceholders(cfg)
+	ports, warnOnMissing := resolvePortsForSource(project, branch, source, placeholderNums)
+
+	resolved, err := resolvePlaceholders(cfg, project, branch, ports)
+	if err != nil {
+		slog.Warn("failed to resolve placeholders", "error", err)
+		return nil
+	}
+
+	if warnOnMissing {
+		for _, pn := range placeholderNums {
+			var num int
+			fmt.Sscanf(pn, "%d", &num)
+			if _, ok := ports[num]; !ok {
+				slog.Warn("port allocation failed for PORT"+pn+", leaving as literal in commands", "placeholder", "<PORT"+pn+">")
+			}
+		}
+	}
+
+	return resolved
+}
+
+// resolvePortsForSource returns the port map to use, based on the portSource.
+// When portSourceLoad, it tries to load from state; if missing or empty, falls back
+// to fresh allocation (and persists the result so subsequent opens match).
+// Returns (ports, warnOnMissing) — warnOnMissing is true if there were placeholders
+// the source could not satisfy (so the caller can log a warning).
+func resolvePortsForSource(project, branch string, source portSource, placeholderNums []string) (map[int]int, bool) {
+	switch source {
+	case portSourceAllocate:
+		ports := allocatePorts(placeholderNums)
+		if err := persistAllocatedPorts(project, branch, ports); err != nil {
+			slog.Warn("failed to persist allocated ports", "error", err)
+		}
+		return ports, true
+
+	case portSourceLoad:
+		ports, err := loadAllocatedPorts(project, branch)
+		if err != nil {
+			slog.Warn("failed to load persisted ports, falling back to fresh allocation", "error", err)
+			ports = allocatePorts(placeholderNums)
+			if perr := persistAllocatedPorts(project, branch, ports); perr != nil {
+				slog.Warn("failed to persist allocated ports", "error", perr)
+			}
+			return ports, true
+		}
+		if ports == nil {
+			// No state file — first open after add (e.g., state dir was wiped on reboot,
+			// or this is a legacy worktree created before persistence was added).
+			// Allocate fresh and persist so subsequent opens match.
+			slog.Info("no persisted port state, allocating fresh ports", "project", project, "branch", branch)
+			ports = allocatePorts(placeholderNums)
+			if perr := persistAllocatedPorts(project, branch, ports); perr != nil {
+				slog.Warn("failed to persist allocated ports", "error", perr)
+			}
+			return ports, true
+		}
+		// Have persisted ports — use them
+		return ports, false
+	}
+
+	// Unknown source — fall back to allocation
+	ports := allocatePorts(placeholderNums)
+	return ports, true
+}
+
+// readAndResolveConfig is the allocating variant of readConfig, used by `add`.
+// Kept as a separate function for backward compatibility and clear call sites.
+func readAndResolveConfig(target, project, branch string) *ResolvedConfig {
+	return readConfig(target, project, branch, portSourceAllocate)
+}
+
+// readAndResolveConfigOpen is the load-from-state variant of readConfig, used by `open`.
+// It re-uses ports that were allocated by the original `aru worktree add` call,
+// ensuring the proxy and tmux env vars stay consistent across reboots.
+func readAndResolveConfigOpen(target, project, branch string) *ResolvedConfig {
+	return readConfig(target, project, branch, portSourceLoad)
+}
+
+// readTeardownConfig reads aru.json and performs name-only resolution
+// (only <PROJECT> and <BRANCH>, no port allocation).
+// If project or branch is empty, warns and returns nil.
+// If aru.json is missing or malformed, warns and returns nil.
+func readTeardownConfig(target, project, branch string) *ResolvedConfig {
+	if project == "" || branch == "" {
+		slog.Warn("project or branch is empty, skipping teardown config")
+		return nil
+	}
+
+	cfg, err := ParseAruConfig(target)
+	if err != nil {
+		slog.Warn("failed to parse aru.json for teardown", "error", err)
+		return nil
+	}
+	if cfg == nil {
+		// No aru.json — nothing to teardown
+		return nil
+	}
+
+	resolved, err := resolveTeardownPlaceholders(cfg, project, branch)
+	if err != nil {
+		slog.Warn("failed to resolve teardown placeholders", "error", err)
+		return nil
+	}
+
+	return resolved
+}
+
+// setupProxy registers a reverse proxy entry. Loads the proxy DB at dbPath,
+// validates the name, and adds the entry. Logs a warning on failure without
+// aborting. The dbPath parameter is the path to the proxy DB JSON file — pass
+// defaultProxyDBPath() in production, or a temp path in tests.
+func setupProxy(dbPath, name string, port int) {
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		slog.Warn("failed to load proxy DB for registration", "error", err)
+		return
+	}
+
+	if err := validateName(name); err != nil {
+		slog.Warn("invalid proxy name after resolution, skipping proxy registration", "name", name, "error", err)
+		return
+	}
+
+	if err := db.Add(name, port); err != nil {
+		slog.Warn("failed to register proxy", "name", name, "port", port, "error", err)
+		return
+	}
+
+	slog.Info("proxy registered", "name", name, "port", port)
+}
+
+// removeProxy removes a reverse proxy entry. Loads the proxy DB at dbPath,
+// deletes the entry. If the entry is not found, it is silently ignored
+// (debug log only). The dbPath parameter is the path to the proxy DB JSON
+// file — pass defaultProxyDBPath() in production, or a temp path in tests.
+func removeProxy(dbPath, name string) {
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		slog.Warn("failed to load proxy DB for cleanup", "error", err)
+		return
+	}
+
+	if err := db.Delete(name); err != nil {
+		slog.Debug("proxy cleanup: entry not found or delete failed", "name", name, "error", err)
+		return
+	}
+
+	slog.Info("proxy removed", "name", name)
 }
 
 // ── Tmux session management ─────────────────────────────────────────────
 
 // setupTmuxSession creates or attaches to a tmux session for a worktree.
-// If port is 0, the setup window is skipped. Blocks until the user detaches.
-func setupTmuxSession(project, branch, worktreeDir string, port int) error {
+// If tmuxConfig is nil or empty, a minimal session (single misc window) is created.
+// If tmuxConfig has entries, the first key is used for new-session and the rest
+// create new-window commands. Blocks until the user detaches.
+func setupTmuxSession(project, branch, worktreeDir string, tmuxConfig TmuxConfig) error {
 	requireCmd("tmux")
 
 	sessionName := sanitizeSessionName(branch)
@@ -392,49 +791,12 @@ func setupTmuxSession(project, branch, worktreeDir string, port int) error {
 		// Session does not exist — create it
 		slog.Info("creating tmux session", "session", sessionName, "dir", worktreeDir)
 
-		// Build tmux new-session command
-		args := []string{
-			"-S", sock,
-			"new-session", "-d", "-s", sessionName, "-n", "misc", "-c", worktreeDir,
-			";", "set-option", "-g", "default-terminal", "xterm-256color",
-			";", "set-option", "-ag", "terminal-overrides", "xterm-256color:Tc",
-			";", "set-option", "-g", "allow-passthrough", "on",
-			";", "set-option", "-g", "mouse", "on",
-			";", "set-option", "-s", "escape-time", "10",
-			";", "set-option", "-g", "default-command", "bash",
-			";", "set-option", "-qs", "extended-keys", "off",
-			";", "set-option", "-qg", "extended-keys", "off",
-		}
-
-		cmd := exec.Command("tmux", args...)
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("worktree: failed to create tmux session: %w", err)
-		}
-
-		// Create pi window if pi command is available
-		if _, err := exec.LookPath("pi"); err == nil {
-			piArgs := []string{
-				"-S", sock,
-				"new-window", "-n", "pi", "-c", worktreeDir,
-				"pi || echo 'pi command not found, falling back to bash'; exec bash",
-			}
-			exec.Command("tmux", piArgs...).Run()
-			exec.Command("tmux", "-S", sock, "select-window", "-t", "pi").Run()
-		}
-
-		// Create setup window if port > 0 and wt-setup.sh exists
-		if port > 0 {
-			setupScript := filepath.Join(worktreeDir, "wt-setup.sh")
-			if _, err := os.Stat(setupScript); err == nil {
-				slog.Info("found wt-setup.sh, creating setup window", "port", port)
-				setupArgs := []string{
-					"-S", sock,
-					"new-window", "-n", "setup", "-c", worktreeDir,
-					fmt.Sprintf("export PORT=%d; bash wt-setup.sh; exec bash", port),
-				}
-				exec.Command("tmux", setupArgs...).Run()
-			}
+		if len(tmuxConfig) == 0 {
+			// Minimal session (backward compat when no config)
+			createMinimalSession(sock, sessionName, worktreeDir)
+		} else {
+			// Config-driven session
+			createConfigSession(sock, sessionName, worktreeDir, tmuxConfig)
 		}
 	}
 
@@ -452,6 +814,115 @@ func setupTmuxSession(project, branch, worktreeDir string, port int) error {
 	}
 
 	return nil
+}
+
+// createMinimalSession creates a basic tmux session with a single misc window.
+// In the minimal case (no user config), we want to land on the pi window
+// (when available) so the user can immediately start working with pi.
+func createMinimalSession(sock, sessionName, worktreeDir string) {
+	args := buildSessionArgs(sock, sessionName, worktreeDir, "misc", "bash; exec bash")
+	cmd := exec.Command("tmux", args...)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		slog.Warn("failed to create minimal tmux session", "error", err)
+	}
+
+	// Create pi window if pi command is available, then select it.
+	// Selecting pi is only appropriate here (no user-defined windows to
+	// override). createConfigSession does NOT select pi — it leaves the
+	// user on their last config-defined window.
+	if tryCreatePiWindow(sock, worktreeDir) {
+		exec.Command("tmux", "-S", sock, "select-window", "-t", "pi").Run()
+	}
+}
+
+// createConfigSession creates a tmux session with windows defined by the config.
+// The first window in the map is created via new-session, the rest via new-window.
+func createConfigSession(sock, sessionName, worktreeDir string, tmuxConfig TmuxConfig) {
+	// Sort keys for deterministic window creation order
+	keys := make([]string, 0, len(tmuxConfig))
+	for k := range tmuxConfig {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for i, name := range keys {
+		win := tmuxConfig[name]
+		cmdStr := buildTmuxCommand(win)
+
+		if i == 0 {
+			// First window: new-session
+			args := buildSessionArgs(sock, sessionName, worktreeDir, name, cmdStr)
+			cmd := exec.Command("tmux", args...)
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				slog.Warn("failed to create tmux session window", "window", name, "error", err)
+			}
+		} else {
+			// Subsequent windows: new-window
+			args := []string{
+				"-S", sock,
+				"new-window", "-n", name, "-c", worktreeDir,
+				cmdStr,
+			}
+			cmd := exec.Command("tmux", args...)
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				slog.Warn("failed to create tmux window", "window", name, "error", err)
+			}
+		}
+	}
+
+	// Auto-create pi window if available and not already present.
+	// Do NOT select it — the user has explicitly defined their windows,
+	// and we don't want to override their intent. The active window
+	// remains the last one we created (their last config-defined window).
+	if _, ok := tmuxConfig["pi"]; !ok {
+		tryCreatePiWindow(sock, worktreeDir)
+	}
+}
+
+// buildSessionArgs builds the tmux new-session argument list with common options.
+func buildSessionArgs(sock, sessionName, worktreeDir, windowName, cmdStr string) []string {
+	return []string{
+		"-S", sock,
+		"new-session", "-d", "-s", sessionName, "-n", windowName, "-c", worktreeDir,
+		cmdStr,
+		";", "set-option", "-g", "default-terminal", "xterm-256color",
+		";", "set-option", "-ag", "terminal-overrides", "xterm-256color:Tc",
+		";", "set-option", "-g", "allow-passthrough", "on",
+		";", "set-option", "-g", "mouse", "on",
+		";", "set-option", "-s", "escape-time", "10",
+		";", "set-option", "-g", "default-command", "bash",
+		";", "set-option", "-qs", "extended-keys", "off",
+		";", "set-option", "-qg", "extended-keys", "off",
+	}
+}
+
+// tryCreatePiWindow creates a pi window if the pi command is available.
+// Returns true if the pi window was created (caller may want to select it
+// in the minimal-session case). Selection is the caller's responsibility
+// — in the config-driven case we leave the active window on the user's
+// last config-defined window.
+//
+// The fallback command `pi || echo ...; exec bash` ensures the window
+// remains usable even if pi is in PATH but fails at runtime (e.g., the
+// binary is broken, or pi exits with an error).
+func tryCreatePiWindow(sock, worktreeDir string) bool {
+	if _, err := exec.LookPath("pi"); err != nil {
+		return false
+	}
+
+	piArgs := []string{
+		"-S", sock,
+		"new-window", "-n", "pi", "-c", worktreeDir,
+		"pi || echo 'pi command not found, falling back to bash'; exec bash",
+	}
+	if err := exec.Command("tmux", piArgs...).Run(); err != nil {
+		slog.Debug("failed to create pi window", "error", err)
+		return false
+	}
+	return true
 }
 
 // waitForSocket polls until tmux reports the session is ready.
@@ -523,18 +994,31 @@ func handleWorktreeAdd(branch string) {
 		slog.Warn("failed to create data symlink", "error", err)
 	}
 
-	// Find open port for setup script
-	port, err := findOpenPort()
-	if err != nil {
-		slog.Warn("no port available, skipping setup window", "error", err)
-		port = 0
+	// Read aru.json config and resolve placeholders
+	resolved := readAndResolveConfig(target, projectName, branch)
+
+	// Run setup commands if config provides them (respects setup_oneshot)
+	runSetupIfNeeded(projectName, branch, target, resolved)
+
+	// Register proxy if configured
+	if resolved != nil && resolved.Proxy != nil && resolved.Proxy.Port != "" {
+		port, err := strconv.Atoi(resolved.Proxy.Port)
+		if err != nil {
+			slog.Warn("invalid proxy port, skipping proxy registration", "port", resolved.Proxy.Port, "error", err)
+		} else {
+			setupProxy(defaultProxyDBPath(), resolved.Proxy.Name, port)
+		}
 	}
 
-	// wt-setup.sh runs inside the tmux setup window (not here)
+	// Determine tmux config (nil if no aru.json)
+	var tmuxConfig TmuxConfig
+	if resolved != nil {
+		tmuxConfig = resolved.Tmux
+	}
 
 	// Launch tmux session
 	fmt.Printf("\nEntering worktree and starting tmux session...\n")
-	if err := setupTmuxSession(projectName, branch, target, port); err != nil {
+	if err := setupTmuxSession(projectName, branch, target, tmuxConfig); err != nil {
 		slog.Warn("failed to start tmux session, falling back to bash", "error", err)
 		fmt.Printf("Falling back to bash in %s\n", target)
 		os.Chdir(target)
@@ -566,6 +1050,19 @@ func handleWorktreeDel(branch string) {
 		os.Exit(1)
 	}
 
+	// Read aru.json for teardown config
+	resolved := readTeardownConfig(target, projectName, branch)
+
+	// Run teardown commands if config provides them
+	if resolved != nil && len(resolved.Teardown) > 0 {
+		runTeardownCommands(target, resolved.Teardown)
+	}
+
+	// Remove proxy if configured
+	if resolved != nil && resolved.Proxy != nil && resolved.Proxy.Name != "" {
+		removeProxy(defaultProxyDBPath(), resolved.Proxy.Name)
+	}
+
 	// Remove data symlink
 	if err := removeDataSymlink(target); err != nil {
 		slog.Warn("failed to remove data symlink", "error", err)
@@ -576,9 +1073,6 @@ func handleWorktreeDel(branch string) {
 	if err := unmountRamDir(ramPath); err != nil {
 		slog.Warn("failed to clean up RAM directory", "path", ramPath, "error", err)
 	}
-
-	// Run wt-destroy.sh if it exists
-	runDestroyScript(target)
 
 	// Kill tmux session
 	sock := socketPath(projectName, branch)
@@ -603,6 +1097,12 @@ func handleWorktreeDel(branch string) {
 
 	// Prune stale administrative files
 	gitPrune()
+
+	// Remove persisted port assignments
+	removeAllocatedPorts(projectName, branch)
+
+	// Remove setup-complete marker (if setup_oneshot was used)
+	clearSetupComplete(projectName, branch)
 
 	fmt.Printf("Worktree %q removed.\n", branch)
 }
@@ -643,8 +1143,31 @@ func handleWorktreeOpen(branch string) {
 		}
 	}
 
-	// Attach tmux session (no setup window)
-	if err := setupTmuxSession(projectName, branch, target, 0); err != nil {
+	// Read aru.json config; load original port assignments from state so the
+	// proxy and tmux env vars stay consistent with the original `aru worktree add`.
+	resolved := readAndResolveConfigOpen(target, projectName, branch)
+
+	// Run setup commands if config provides them (respects setup_oneshot)
+	runSetupIfNeeded(projectName, branch, target, resolved)
+
+	// Re-register proxy if configured
+	if resolved != nil && resolved.Proxy != nil && resolved.Proxy.Port != "" {
+		port, err := strconv.Atoi(resolved.Proxy.Port)
+		if err != nil {
+			slog.Warn("invalid proxy port, skipping proxy registration", "port", resolved.Proxy.Port, "error", err)
+		} else {
+			setupProxy(defaultProxyDBPath(), resolved.Proxy.Name, port)
+		}
+	}
+
+	// Determine tmux config (nil if no aru.json)
+	var tmuxConfig TmuxConfig
+	if resolved != nil {
+		tmuxConfig = resolved.Tmux
+	}
+
+	// Attach tmux session with config
+	if err := setupTmuxSession(projectName, branch, target, tmuxConfig); err != nil {
 		slog.Warn("failed to start tmux session, falling back to bash", "error", err)
 		fmt.Printf("Falling back to bash in %s\n", target)
 		os.Chdir(target)

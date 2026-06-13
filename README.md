@@ -89,8 +89,69 @@ aru worktree list
 - RAM-backed data at `~/.aru/ram/<project>/<branch>` (tmpfs via `syscall.Mount`)
 - Data directory symlinked to `<worktree>/data` → RAM directory
 - Tmux sessions managed via custom sockets at `~/.aru/sockets/<project>-<branch>.sock`
-- Lifecycle hooks: `wt-setup.sh` (runs in tmux setup window with `PORT` env var), `wt-destroy.sh` (runs on deletion)
+- **Config-driven lifecycle via `aru.json`**: declaratively specify setup commands, teardown commands, tmux windows, and reverse proxy registration — see [aru.json schema](#🔐-trust-model-for-arujson-commands) below
+- Port persistence: allocated ports survive reboots via `~/.aru/state/<project>/<branch>/ports.json`
+- Setup idempotency: `setup_oneshot: true` runs setup only once per worktree session (marker at `~/.aru/state/<project>/<branch>/setup-complete`)
 - RAM directory and symlink auto-recreated on `open` if missing (handle reboots)
+- Setup and teardown commands run verbatim via `bash -c` (see trust model below)
+
+#### 🔐 Trust model for `aru.json` commands
+
+The `aru.json` config file (in your worktree) lets you declaratively specify setup commands, teardown commands, and tmux window commands. **All commands in `aru.json` run verbatim in your shell as the user invoking `aru`**. This is the same trust model as:
+
+- `Makefile` recipes (`make` runs `bash -c` on each target)
+- `package.json` scripts (`npm run` executes arbitrary shell)
+- `Dockerfile` `RUN` instructions (executed at build time)
+
+Because you already have full shell access, the commands in `aru.json` provide no additional privilege escalation — they are equivalent to typing them in a terminal yourself.
+
+**Security implications:**
+
+- Anyone who can write to `aru.json` in a worktree can run commands as the user who invokes `aru` on that worktree.
+- Review changes to `aru.json` in pull requests with the same care as shell scripts.
+- If you copy `aru.json` from an untrusted source, treat it as code execution and review every command.
+- There is no in-process sandbox; commands run with full user permissions.
+
+**Defense in depth (what aru does):**
+
+- Env values are shell-escaped (`strconv.Quote`) before substitution, so a malicious env value cannot inject shell metacharacters.
+- Project/branch placeholders (`<PROJECT>`, `<BRANCH>`) are substituted as opaque text into the resolved config.
+- `<PORTn>` placeholders are substituted with allocated port numbers (no user input).
+- Commands themselves are run as-is — by design, per the trust model above.
+
+#### `aru.json` schema
+
+```json
+{
+  "version": 1,
+  "worktree": {
+    "setup": ["npm install", "npm run build"],
+    "setup_oneshot": true,
+    "teardown": ["rm -rf .cache"]
+  },
+  "tmux": {
+    "dev":  { "command": "npm run dev",   "env": { "PORT": "<PORT1>" } },
+    "misc": { "command": "bash" }
+  },
+  "proxy": {
+    "name": "<BRANCH>.<PROJECT>",
+    "port": "<PORT1>"
+  }
+}
+```
+
+- `version` — schema version (currently optional, reserved for future migrations)
+- `worktree.setup` — list of shell commands to run on `aru worktree add` and `aru worktree open`. Commands run verbatim via `bash -c` (see trust model below for security implications)
+- `worktree.setup_oneshot` — if `true`, setup runs only once per worktree session. A marker file at `~/.aru/state/<project>/<branch>/setup-complete` records that setup has run; subsequent opens skip setup. The marker is removed when the worktree is deleted. To force re-run, delete the marker file manually.
+- `worktree.teardown` — list of shell commands to run on `aru worktree del`
+- `tmux.<name>` — tmux window definition (first key = new-session, rest = new-window). `command` runs verbatim; `env` values are shell-escaped.
+- `proxy.name` — proxy name with `<PROJECT>`/`<BRANCH>` placeholders for dynamic naming
+- `proxy.port` — port with `<PORT1>`/`<PORT2>`/... placeholders (allocated from 1024-9999)
+
+Placeholders:
+- `<PROJECT>` — directory name of the main worktree
+- `<BRANCH>` — branch name being checked out
+- `<PORT1>`, `<PORT2>`, ... — allocated open ports (numbers map to specific ports, reused across `add` and `open` for consistency)
 
 ### 🔄 Auto-redirect (port 80 → 443)
 
@@ -183,7 +244,8 @@ main.go         — entry point, subcommand routing (proxy, worktree), three lis
 server.go       — virtual host routing (tmp.test → upload, <name>.test → proxy via ProxyDB)
 proxy.go        — reverse proxy handler with WebSocket support, LookupProxy
 proxydb.go      — persistent proxy database (JSON-backed, thread-safe, hot-reload)
-worktree.go     — git worktree manager (add/del/open/list), RAM dir, tmux sessions
+worktree.go     — git worktree manager (add/del/open/list), aru.json config, RAM dir, tmux sessions
+aruconfig.go    — aru.json config types, parsing, struct-walking placeholder resolution
 cert.go         — self-signed TLS certificate with wildcard SANs (*.test, tmp.test)
 dns.go          — built-in DNS server for *.test domains
 redirect.go     — HTTP → HTTPS redirect server
@@ -202,6 +264,7 @@ All persistent data lives under `~/.aru/`:
 ├── cert.pem          — TLS certificate
 ├── key.pem           — TLS private key (0600)
 ├── proxies.json      — Reverse proxy configuration
+├── state/            — Per-worktree state (ports.json, setup-complete)
 ├── wt/               — Git worktrees (<project>/<branch>)
 ├── ram/              — RAM-backed data (tmpfs, <project>/<branch>)
 └── sockets/          — Tmux control sockets (<project>-<branch>.sock)

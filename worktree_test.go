@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -335,6 +337,514 @@ func TestSetupDataSymlink(t *testing.T) {
 	}
 }
 
+func TestSetupDataSymlink_PreservesExistingDir(t *testing.T) {
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "worktree")
+	ramPath := filepath.Join(tmp, "ram")
+
+	if err := os.MkdirAll(ramPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a real `data` directory with content
+	dataDir := filepath.Join(target, "data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dataDir, "user-content")
+	if err := os.WriteFile(marker, []byte("important"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// setupDataSymlink should warn and skip, not destroy the directory
+	if err := setupDataSymlink(target, ramPath); err != nil {
+		t.Fatalf("setupDataSymlink() returned error: %v", err)
+	}
+
+	// Verify data directory still exists with user content
+	if _, err := os.Stat(marker); os.IsNotExist(err) {
+		t.Error("user content was destroyed — setupDataSymlink should skip when data is not a symlink")
+	}
+	// Verify it is NOT a symlink
+	if fi, err := os.Lstat(dataDir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		t.Error("data was converted to a symlink — should have been preserved as a directory")
+	}
+}
+
+// ── Port state persistence tests ─────────────────────────────────────
+
+func TestStateDir(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := filepath.Join(home, ".aru", "state", "myproject", "feature-x")
+	got := stateDir("myproject", "feature-x")
+	if got != expected {
+		t.Errorf("stateDir() = %q, want %q", got, expected)
+	}
+}
+
+func TestPersistAllocatedPorts(t *testing.T) {
+	// Use a unique test project name so we don't collide with real worktrees
+	project := "test-persist-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+	t.Cleanup(func() {
+		removeAllocatedPorts(project, branch)
+	})
+
+	ports := map[int]int{1: 3421, 2: 8888, 3: 5000}
+	if err := persistAllocatedPorts(project, branch, ports); err != nil {
+		t.Fatalf("persistAllocatedPorts() returned error: %v", err)
+	}
+
+	// Verify file exists
+	if _, err := os.Stat(portsStatePath(project, branch)); os.IsNotExist(err) {
+		t.Fatal("ports state file was not created")
+	}
+
+	// Verify file has 0600 perms (least privilege)
+	fi, err := os.Stat(portsStatePath(project, branch))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0600 {
+		t.Errorf("ports state file perms = %o, want 0600", perm)
+	}
+}
+
+func TestPersistAllocatedPorts_Empty(t *testing.T) {
+	// Empty map should be a no-op (no file created)
+	project := "test-empty-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+
+	if err := persistAllocatedPorts(project, branch, map[int]int{}); err != nil {
+		t.Fatalf("persistAllocatedPorts() returned error: %v", err)
+	}
+
+	if _, err := os.Stat(portsStatePath(project, branch)); !os.IsNotExist(err) {
+		t.Error("empty ports map should not create a state file")
+	}
+}
+
+func TestLoadAllocatedPorts_Valid(t *testing.T) {
+	project := "test-load-valid-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+	t.Cleanup(func() {
+		removeAllocatedPorts(project, branch)
+	})
+
+	original := map[int]int{1: 3421, 2: 8888, 3: 5000}
+	if err := persistAllocatedPorts(project, branch, original); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadAllocatedPorts(project, branch)
+	if err != nil {
+		t.Fatalf("loadAllocatedPorts() returned error: %v", err)
+	}
+	if len(loaded) != len(original) {
+		t.Errorf("loaded %d ports, want %d", len(loaded), len(original))
+	}
+	for num, port := range original {
+		if loaded[num] != port {
+			t.Errorf("loaded[%d] = %d, want %d", num, loaded[num], port)
+		}
+	}
+}
+
+func TestLoadAllocatedPorts_Missing(t *testing.T) {
+	project := "test-missing-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+
+	ports, err := loadAllocatedPorts(project, branch)
+	if err != nil {
+		t.Errorf("loadAllocatedPorts() for missing file returned error: %v", err)
+	}
+	if ports != nil {
+		t.Errorf("loadAllocatedPorts() for missing file = %v, want nil", ports)
+	}
+}
+
+func TestLoadAllocatedPorts_Corrupt(t *testing.T) {
+	project := "test-corrupt-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+	t.Cleanup(func() {
+		removeAllocatedPorts(project, branch)
+	})
+
+	// Create a corrupt JSON file
+	path := portsStatePath(project, branch)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{not valid json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadAllocatedPorts(project, branch)
+	if err == nil {
+		t.Error("loadAllocatedPorts() for corrupt JSON should return error")
+	}
+}
+
+func TestRemoveAllocatedPorts(t *testing.T) {
+	project := "test-remove-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+
+	if err := persistAllocatedPorts(project, branch, map[int]int{1: 3000}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sanity check: file exists
+	if _, err := os.Stat(portsStatePath(project, branch)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remove
+	removeAllocatedPorts(project, branch)
+
+	// Verify file is gone
+	if _, err := os.Stat(portsStatePath(project, branch)); !os.IsNotExist(err) {
+		t.Error("state file should be gone after remove")
+	}
+
+	// Remove again should not panic (best-effort)
+	removeAllocatedPorts(project, branch)
+}
+
+// ── Setup idempotency (M1) tests ─────────────────────────────────────────
+
+func TestIsSetupComplete_FreshWorktree(t *testing.T) {
+	project := "test-oneshot-fresh-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+	if isSetupComplete(project, branch) {
+		t.Error("isSetupComplete should be false for a fresh worktree")
+	}
+}
+
+func TestMarkSetupComplete(t *testing.T) {
+	project := "test-oneshot-mark-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+	t.Cleanup(func() {
+		clearSetupComplete(project, branch)
+	})
+
+	if isSetupComplete(project, branch) {
+		t.Fatal("pre-condition: should not be complete yet")
+	}
+
+	if err := markSetupComplete(project, branch); err != nil {
+		t.Fatalf("markSetupComplete returned error: %v", err)
+	}
+
+	if !isSetupComplete(project, branch) {
+		t.Error("isSetupComplete should be true after markSetupComplete")
+	}
+
+	// Idempotent — second call should not error
+	if err := markSetupComplete(project, branch); err != nil {
+		t.Errorf("second markSetupComplete returned error: %v", err)
+	}
+}
+
+func TestClearSetupComplete(t *testing.T) {
+	project := "test-oneshot-clear-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+
+	if err := markSetupComplete(project, branch); err != nil {
+		t.Fatal(err)
+	}
+	if !isSetupComplete(project, branch) {
+		t.Fatal("pre-condition: should be complete after mark")
+	}
+
+	clearSetupComplete(project, branch)
+
+	if isSetupComplete(project, branch) {
+		t.Error("isSetupComplete should be false after clearSetupComplete")
+	}
+
+	// Clear again should not panic
+	clearSetupComplete(project, branch)
+}
+
+func TestRunSetupIfNeeded_RunsWhenNoMarker(t *testing.T) {
+	tmp := t.TempDir()
+	project := "test-oneshot-run-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+	t.Cleanup(func() {
+		clearSetupComplete(project, branch)
+	})
+
+	marker := filepath.Join(tmp, "cmd-ran")
+	resolved := &ResolvedConfig{
+		Setup:        []string{"touch " + marker},
+		SetupOneshot: true,
+	}
+
+	runSetupIfNeeded(project, branch, tmp, resolved)
+
+	if _, err := os.Stat(marker); os.IsNotExist(err) {
+		t.Error("setup command should have run (no marker present)")
+	}
+	if !isSetupComplete(project, branch) {
+		t.Error("marker should be set after successful setup")
+	}
+}
+
+func TestRunSetupIfNeeded_SkipsWhenMarkerExists(t *testing.T) {
+	tmp := t.TempDir()
+	project := "test-oneshot-skip-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+	t.Cleanup(func() {
+		clearSetupComplete(project, branch)
+	})
+
+	// Pre-populate the marker (simulating "already ran once")
+	if err := markSetupComplete(project, branch); err != nil {
+		t.Fatal(err)
+	}
+
+	marker := filepath.Join(tmp, "cmd-ran")
+	resolved := &ResolvedConfig{
+		Setup:        []string{"touch " + marker},
+		SetupOneshot: true,
+	}
+
+	runSetupIfNeeded(project, branch, tmp, resolved)
+
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Error("setup command should NOT have run (marker exists, oneshot=true)")
+	}
+}
+
+func TestRunSetupIfNeeded_RunsWhenOneshotFalse(t *testing.T) {
+	tmp := t.TempDir()
+	project := "test-oneshot-false-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+	t.Cleanup(func() {
+		clearSetupComplete(project, branch)
+	})
+
+	// Pre-populate the marker — but SetupOneshot is false, so we should
+	// still run setup.
+	if err := markSetupComplete(project, branch); err != nil {
+		t.Fatal(err)
+	}
+
+	marker := filepath.Join(tmp, "cmd-ran")
+	resolved := &ResolvedConfig{
+		Setup:        []string{"touch " + marker},
+		SetupOneshot: false, // explicitly false
+	}
+
+	runSetupIfNeeded(project, branch, tmp, resolved)
+
+	if _, err := os.Stat(marker); os.IsNotExist(err) {
+		t.Error("setup command should have run (SetupOneshot=false even with marker)")
+	}
+}
+
+func TestRunSetupIfNeeded_NilResolved(t *testing.T) {
+	// Should not panic
+	runSetupIfNeeded("any", "any", t.TempDir(), nil)
+}
+
+func TestRunSetupIfNeeded_EmptySetup(t *testing.T) {
+	// Should not panic and should not create a marker
+	project := "test-oneshot-empty-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+	t.Cleanup(func() {
+		clearSetupComplete(project, branch)
+	})
+
+	resolved := &ResolvedConfig{
+		Setup:        nil,
+		SetupOneshot: true,
+	}
+
+	runSetupIfNeeded(project, branch, t.TempDir(), resolved)
+
+	if isSetupComplete(project, branch) {
+		t.Error("empty setup list should not create a marker")
+	}
+}
+
+func TestRunSetupIfNeeded_SetsMarkerOnFailure(t *testing.T) {
+	// We intentionally write the marker even if commands fail, because
+	// the trust model is "user ran the setup, treat as success." This
+	// test documents that behavior so it's not a surprise.
+
+	tmp := t.TempDir()
+	project := "test-oneshot-fail-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+	t.Cleanup(func() {
+		clearSetupComplete(project, branch)
+	})
+
+	resolved := &ResolvedConfig{
+		Setup:        []string{"exit 1"}, // failing command
+		SetupOneshot: true,
+	}
+
+	runSetupIfNeeded(project, branch, tmp, resolved)
+
+	// Document: marker IS written even on failure (per the function's
+	// contract). If user wants to re-run after fixing, they can delete
+	// the marker.
+	if !isSetupComplete(project, branch) {
+		t.Error("marker should be written after setup attempt (even on failure) — see function comment")
+	}
+}
+
+func TestReadConfig_AllocateAndPersist(t *testing.T) {
+	dir := t.TempDir()
+	jsonContent := `{
+		"worktree": {"setup": ["echo <PROJECT>:<PORT1>"]},
+		"tmux": {"dev": {"command": "npm run dev", "env": {"PORT": "<PORT1>"}}}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "aru.json"), []byte(jsonContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	project := "test-alloc-persist-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+	t.Cleanup(func() {
+		removeAllocatedPorts(project, branch)
+	})
+
+	resolved := readConfig(dir, project, branch, portSourceAllocate)
+	if resolved == nil {
+		t.Fatal("readConfig() returned nil")
+	}
+	if len(resolved.Setup) == 0 {
+		t.Fatal("setup is empty")
+	}
+
+	// Setup command should have a real port (e.g., "myproject:3421"), not a literal <PORT1>
+	setupCmd := resolved.Setup[0]
+	if strings.Contains(setupCmd, "<PORT1>") {
+		t.Errorf("setup command still has literal <PORT1>: %q", setupCmd)
+	}
+
+	// Verify ports were persisted to state file
+	loaded, err := loadAllocatedPorts(project, branch)
+	if err != nil {
+		t.Fatalf("loadAllocatedPorts() returned error: %v", err)
+	}
+	if len(loaded) == 0 {
+		t.Error("ports were not persisted after allocation")
+	}
+
+	// The tmux env PORT should match the persisted port
+	tmuxPort := resolved.Tmux["dev"].Env["PORT"]
+	persistedPort := fmt.Sprint(loaded[1])
+	if tmuxPort != persistedPort {
+		t.Errorf("tmux env PORT = %q, persisted port = %q — should match", tmuxPort, persistedPort)
+	}
+}
+
+func TestReadConfig_Load_ReusesPersistedPorts(t *testing.T) {
+	dir := t.TempDir()
+	jsonContent := `{
+		"worktree": {"setup": ["echo <PROJECT>:<PORT1>"]},
+		"tmux": {"dev": {"command": "npm run dev", "env": {"PORT": "<PORT1>"}}}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "aru.json"), []byte(jsonContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	project := "test-load-reuse-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+	t.Cleanup(func() {
+		removeAllocatedPorts(project, branch)
+	})
+
+	// Simulate the original `aru worktree add` by allocating + persisting
+	original := readConfig(dir, project, branch, portSourceAllocate)
+	if original == nil {
+		t.Fatal("initial allocation returned nil")
+	}
+	originalPort := original.Tmux["dev"].Env["PORT"]
+
+	// Simulate the `aru worktree open` call — should re-use the persisted port
+	reopened := readConfig(dir, project, branch, portSourceLoad)
+	if reopened == nil {
+		t.Fatal("load-based read returned nil")
+	}
+	reopenedPort := reopened.Tmux["dev"].Env["PORT"]
+
+	if originalPort != reopenedPort {
+		t.Errorf("port changed across open: original=%q reopened=%q", originalPort, reopenedPort)
+	}
+}
+
+func TestReadConfig_Load_FallsBackToAllocate(t *testing.T) {
+	dir := t.TempDir()
+	jsonContent := `{"worktree": {"setup": ["echo <PORT1>"]}}`
+	if err := os.WriteFile(filepath.Join(dir, "aru.json"), []byte(jsonContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	project := "test-load-fallback-" + fmt.Sprint(time.Now().UnixNano())
+	branch := "test-branch"
+	t.Cleanup(func() {
+		removeAllocatedPorts(project, branch)
+	})
+
+	// No state file exists — load mode should fall back to allocation
+	resolved := readConfig(dir, project, branch, portSourceLoad)
+	if resolved == nil {
+		t.Fatal("readConfig with load mode and missing state should fall back to allocation")
+	}
+	if strings.Contains(resolved.Setup[0], "<PORT1>") {
+		t.Errorf("port placeholder not resolved: %q", resolved.Setup[0])
+	}
+
+	// State file should now exist (created during fallback)
+	loaded, err := loadAllocatedPorts(project, branch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) == 0 {
+		t.Error("fallback allocation did not persist ports")
+	}
+}
+
+func TestReadConfig_EmptyProjectOrBranch(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "aru.json"), []byte(`{"worktree":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if resolved := readConfig(dir, "", "branch", portSourceAllocate); resolved != nil {
+		t.Error("empty project should return nil")
+	}
+	if resolved := readConfig(dir, "project", "", portSourceAllocate); resolved != nil {
+		t.Error("empty branch should return nil")
+	}
+}
+
+func TestReadConfig_MissingAruJson(t *testing.T) {
+	dir := t.TempDir() // no aru.json
+	if resolved := readConfig(dir, "p", "b", portSourceAllocate); resolved != nil {
+		t.Error("missing aru.json should return nil")
+	}
+}
+
+func TestReadConfig_MalformedAruJson(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "aru.json"), []byte("{not json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if resolved := readConfig(dir, "p", "b", portSourceAllocate); resolved != nil {
+		t.Error("malformed aru.json should return nil")
+	}
+}
+
 func TestRemoveDataSymlink(t *testing.T) {
 	tmp := t.TempDir()
 	target := filepath.Join(tmp, "worktree")
@@ -361,56 +871,366 @@ func TestRemoveDataSymlink(t *testing.T) {
 	}
 }
 
-func TestRunDestroyScript(t *testing.T) {
+func TestRunSetupCommands_Order(t *testing.T) {
 	tmp := t.TempDir()
-	scriptPath := filepath.Join(tmp, "wt-destroy.sh")
-	marker := filepath.Join(tmp, "destroy-ran")
+	marker1 := filepath.Join(tmp, "cmd1-ran")
+	marker2 := filepath.Join(tmp, "cmd2-ran")
 
-	script := "#!/usr/bin/env bash\ntouch " + marker + "\n"
-	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
-		t.Fatal(err)
+	cmd1 := "touch " + marker1
+	cmd2 := "touch " + marker2
+
+	runSetupCommands(tmp, []string{cmd1, cmd2})
+
+	if _, err := os.Stat(marker1); os.IsNotExist(err) {
+		t.Error("command 1 did not run")
+	}
+	if _, err := os.Stat(marker2); os.IsNotExist(err) {
+		t.Error("command 2 did not run")
 	}
 
-	runDestroyScript(tmp)
+	// Verify order: marker1's mtime must be <= marker2's mtime
+	fi1, err1 := os.Stat(marker1)
+	fi2, err2 := os.Stat(marker2)
+	if err1 != nil || err2 != nil {
+		t.Fatal("stat failed")
+	}
+	if fi1.ModTime().After(fi2.ModTime()) {
+		t.Errorf("command 1 ran after command 2: mtime1=%v > mtime2=%v", fi1.ModTime(), fi2.ModTime())
+	}
+}
+
+func TestRunSetupCommands_ContinuesOnFailure(t *testing.T) {
+	tmp := t.TempDir()
+	marker := filepath.Join(tmp, "second-ran")
+
+	cmd1 := "exit 1"
+	cmd2 := "touch " + marker
+
+	runSetupCommands(tmp, []string{cmd1, cmd2})
 
 	if _, err := os.Stat(marker); os.IsNotExist(err) {
-		t.Error("destroy script did not run")
+		t.Error("command 2 did not run after command 1 failed")
 	}
 }
 
-func TestRunDestroyScript_SkipWhenAbsent(t *testing.T) {
-	tmp := t.TempDir()
-	// Should not error when script doesn't exist — just a no-op
-	runDestroyScript(tmp)
+func TestRunSetupCommands_Empty(t *testing.T) {
+	// Should not panic or error
+	runSetupCommands(t.TempDir(), nil)
+	runSetupCommands(t.TempDir(), []string{})
 }
 
-func TestRunSetupScript(t *testing.T) {
+func TestRunTeardownCommands_Order(t *testing.T) {
 	tmp := t.TempDir()
-	scriptPath := filepath.Join(tmp, "wt-setup.sh")
-	marker := filepath.Join(tmp, "setup-ran")
+	marker1 := filepath.Join(tmp, "teardown-cmd1-ran")
+	marker2 := filepath.Join(tmp, "teardown-cmd2-ran")
 
-	script := "#!/usr/bin/env bash\necho \"$PORT\" > " + marker + "\n"
-	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+	cmd1 := "touch " + marker1
+	cmd2 := "touch " + marker2
+
+	runTeardownCommands(tmp, []string{cmd1, cmd2})
+
+	if _, err := os.Stat(marker1); os.IsNotExist(err) {
+		t.Error("teardown command 1 did not run")
+	}
+	if _, err := os.Stat(marker2); os.IsNotExist(err) {
+		t.Error("teardown command 2 did not run")
+	}
+}
+
+func TestRunTeardownCommands_Empty(t *testing.T) {
+	runTeardownCommands(t.TempDir(), nil)
+	runTeardownCommands(t.TempDir(), []string{})
+}
+
+func TestRunTeardownCommands_ContinuesOnFailure(t *testing.T) {
+	tmp := t.TempDir()
+	marker := filepath.Join(tmp, "second-ran")
+
+	cmd1 := "exit 1"
+	cmd2 := "touch " + marker
+
+	runTeardownCommands(tmp, []string{cmd1, cmd2})
+
+	if _, err := os.Stat(marker); os.IsNotExist(err) {
+		t.Error("teardown command 2 did not run after command 1 failed")
+	}
+}
+
+// ── Proxy registration tests ────────────────────────────────────────────
+
+func TestSetupProxy_Success(t *testing.T) {
+	// Use a temp proxy DB so we don't touch the real one
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "proxies.json")
+	if err := os.WriteFile(dbPath, []byte(`{"version":1,"proxies":{}}`), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	runSetupScript(tmp, "8888")
-
-	data, err := os.ReadFile(marker)
+	// Override the default path by directly using LoadProxyDB
+	db, err := LoadProxyDB(dbPath)
 	if err != nil {
-		t.Fatalf("setup script did not run: %v", err)
+		t.Fatal(err)
 	}
 
-	port := strings.TrimSpace(string(data))
-	if port != "8888" {
-		t.Errorf("setup script saw PORT=%q, want '8888'", port)
+	if err := db.Add("myapp", 3000); err != nil {
+		t.Fatalf("db.Add returned error: %v", err)
+	}
+
+	// Reload and verify
+	db2, err := LoadProxyDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, ok := db2.Get("myapp")
+	if !ok || port != 3000 {
+		t.Errorf("proxy not persisted: got port=%d ok=%v, want 3000 true", port, ok)
 	}
 }
 
-func TestRunSetupScript_SkipWhenAbsent(t *testing.T) {
+func TestSetupProxy_InvalidName(t *testing.T) {
+	if err := validateName("test"); err == nil {
+		t.Error("validateName(test) should fail (reserved name)")
+	}
+	if err := validateName("tmp"); err == nil {
+		t.Error("validateName(tmp) should fail (reserved name)")
+	}
+	if err := validateName("valid-name_123"); err != nil {
+		t.Errorf("validateName(valid-name_123) returned error: %v", err)
+	}
+}
+
+func TestRemoveProxy_NotFound(t *testing.T) {
 	tmp := t.TempDir()
-	// Should not error when script doesn't exist
-	runSetupScript(tmp, "8888")
+	dbPath := filepath.Join(tmp, "proxies.json")
+	if err := os.WriteFile(dbPath, []byte(`{"version":1,"proxies":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Remove nonexistent entry should return error
+	if err := db.Delete("nonexistent"); err == nil {
+		t.Error("db.Delete(nonexistent) should return error")
+	}
+}
+
+func TestRemoveProxy_Success(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "proxies.json")
+	if err := os.WriteFile(dbPath, []byte(`{"version":1,"proxies":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Add("tobedel", 4000); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Delete("tobedel"); err != nil {
+		t.Errorf("db.Delete returned error: %v", err)
+	}
+
+	if _, ok := db.Get("tobedel"); ok {
+		t.Error("entry should be gone after delete")
+	}
+}
+
+// ── setupProxy / removeProxy wrapper tests (F3) ───────────────────────────
+
+// These tests exercise the wrapper functions (which were previously at 0%
+// coverage) by passing a temp proxy DB path directly.
+
+func TestSetupProxy_Wrapper_AddsEntry(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "proxies.json")
+	if err := os.WriteFile(dbPath, []byte(`{"version":1,"proxies":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Call the wrapper with a temp DB path
+	setupProxy(dbPath, "myapp", 3000)
+
+	// Verify the entry was added by reloading the DB
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, ok := db.Get("myapp")
+	if !ok || port != 3000 {
+		t.Errorf("setupProxy did not add entry: got port=%d ok=%v, want 3000 true", port, ok)
+	}
+}
+
+func TestSetupProxy_Wrapper_SkipsInvalidName(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "proxies.json")
+	if err := os.WriteFile(dbPath, []byte(`{"version":1,"proxies":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reserved name "test" should be rejected by validateName
+	setupProxy(dbPath, "test", 3000)
+
+	// Verify nothing was added
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.Len() != 0 {
+		t.Errorf("setupProxy with invalid name should not add entry, got %d entries", db.Len())
+	}
+}
+
+func TestSetupProxy_Wrapper_HandlesMissingDB(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "nonexistent.json") // file does not exist
+
+	// Should not panic; LoadProxyDB creates an empty DB if file doesn't exist
+	setupProxy(dbPath, "newapp", 5000)
+
+	// Verify the entry was created
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, ok := db.Get("newapp")
+	if !ok || port != 5000 {
+		t.Errorf("setupProxy did not create entry in fresh DB: got port=%d ok=%v", port, ok)
+	}
+}
+
+func TestRemoveProxy_Wrapper_RemovesEntry(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "proxies.json")
+	if err := os.WriteFile(dbPath, []byte(`{"version":1,"proxies":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-populate
+	setupProxy(dbPath, "tobedel", 4000)
+
+	// Remove via wrapper
+	removeProxy(dbPath, "tobedel")
+
+	// Verify gone
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := db.Get("tobedel"); ok {
+		t.Error("removeProxy did not remove entry")
+	}
+}
+
+func TestRemoveProxy_Wrapper_SilentlyIgnoresMissing(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "proxies.json")
+	if err := os.WriteFile(dbPath, []byte(`{"version":1,"proxies":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remove a non-existent entry — should not panic
+	removeProxy(dbPath, "never-existed")
+
+	// Verify DB is still empty but valid
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.Len() != 0 {
+		t.Errorf("DB should still be empty, got %d entries", db.Len())
+	}
+}
+
+func TestRemoveProxy_Wrapper_HandlesMissingDB(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "nonexistent.json") // file does not exist
+
+	// Should not panic on missing DB
+	removeProxy(dbPath, "anyname")
+}
+
+func TestSetupProxy_Wrapper_HandlesAddError(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "proxies.json")
+	if err := os.WriteFile(dbPath, []byte(`{"version":1,"proxies":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Port 53 is blocked by validatePort, so db.Add will fail
+	// Should not panic; should log warning
+	setupProxy(dbPath, "valid-name", 53)
+
+	// Verify nothing was added
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.Len() != 0 {
+		t.Errorf("setupProxy with blocked port should not add entry, got %d entries", db.Len())
+	}
+}
+
+func TestBuildTmuxCommand_NoEnv(t *testing.T) {
+	win := TmuxWindow{Command: "npm run dev"}
+	got := buildTmuxCommand(win)
+	want := "npm run dev; exec bash"
+	if got != want {
+		t.Errorf("buildTmuxCommand() = %q, want %q", got, want)
+	}
+}
+
+func TestBuildTmuxCommand_WithEnv(t *testing.T) {
+	win := TmuxWindow{
+		Command: "npm run dev",
+		Env:     map[string]string{"PORT": "3000"},
+	}
+	got := buildTmuxCommand(win)
+	// Should use shell quoting for the env value
+	want := "export PORT=\"3000\"; npm run dev; exec bash"
+	if got != want {
+		t.Errorf("buildTmuxCommand() = %q, want %q", got, want)
+	}
+}
+
+func TestBuildTmuxCommand_MultipleEnv(t *testing.T) {
+	win := TmuxWindow{
+		Command: "node server.js",
+		Env:     map[string]string{"PORT": "3000", "HOST": "localhost"},
+	}
+	got := buildTmuxCommand(win)
+	// Env vars should be sorted alphabetically: HOST, then PORT
+	want := "export HOST=\"localhost\"; export PORT=\"3000\"; node server.js; exec bash"
+	if got != want {
+		t.Errorf("buildTmuxCommand() = %q, want %q", got, want)
+	}
+}
+
+func TestBuildTmuxCommand_EmptyCommand(t *testing.T) {
+	win := TmuxWindow{}
+	got := buildTmuxCommand(win)
+	want := "exec bash"
+	if got != want {
+		t.Errorf("buildTmuxCommand() = %q, want %q", got, want)
+	}
+}
+
+func TestBuildTmuxCommand_OnlyEnv(t *testing.T) {
+	win := TmuxWindow{
+		Env: map[string]string{"PORT": "8080"},
+	}
+	got := buildTmuxCommand(win)
+	want := "export PORT=\"8080\"; exec bash"
+	if got != want {
+		t.Errorf("buildTmuxCommand() = %q, want %q", got, want)
+	}
 }
 
 func TestMountRamDir(t *testing.T) {
@@ -450,23 +1270,18 @@ func TestGitPull(t *testing.T) {
 // ── Unit 3: Tmux session management ─────────────────────────────────────
 
 func TestSetupTmuxSession_MissingTmux(t *testing.T) {
-	// Should exit with error when tmux is not in PATH
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not found in PATH — cannot test tmux behavior")
-	}
-
-	// We can't easily test the missing tmux path because it calls os.Exit(1)
-	// Just verify the function doesn't crash when tmux IS available
-	t.Log("tmux is available — testing basic session creation")
+	// Use a PATH that has no tmux in it
+	mockDir := t.TempDir()
+	createMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir) // only the mock dir; if it doesn't have a binary, real tmux won't be found
+	// (This test still relies on the mock to act as tmux; the test name is historical.)
+	t.Log("tmux mock available — testing basic session creation")
 }
 
-func TestSetupTmuxSession_CreateAndKill(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping tmux integration test in short mode")
-	}
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not found in PATH")
-	}
+func TestSetupTmuxSession_NilConfig(t *testing.T) {
+	mockDir := t.TempDir()
+	createMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
 
 	tmp := t.TempDir()
 	project := "testproj"
@@ -487,7 +1302,7 @@ func TestSetupTmuxSession_CreateAndKill(t *testing.T) {
 				errCh <- fmt.Errorf("panic: %v", r)
 			}
 		}()
-		setupTmuxSession(project, branch, tmp, 0)
+		setupTmuxSession(project, branch, tmp, nil)
 		errCh <- nil
 	}()
 
@@ -499,6 +1314,330 @@ func TestSetupTmuxSession_CreateAndKill(t *testing.T) {
 	}
 
 	exec.Command("tmux", "-S", sock, "kill-session", "-t", sessionName).Run()
+}
+
+func TestSetupTmuxSession_EmptyConfig(t *testing.T) {
+	mockDir := t.TempDir()
+	createMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	tmp := t.TempDir()
+	project := "testproj"
+	branch := "test-branch"
+
+	sock := socketPath(project, branch)
+	sessionName := sanitizeSessionName(branch)
+
+	t.Cleanup(func() {
+		exec.Command("tmux", "-S", sock, "kill-session", "-t", sessionName).Run()
+		os.Remove(sock)
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				errCh <- fmt.Errorf("panic: %v", r)
+			}
+		}()
+		setupTmuxSession(project, branch, tmp, TmuxConfig{})
+		errCh <- nil
+	}()
+
+	waitForSocket(sock, sessionName, 5*time.Second)
+
+	check := exec.Command("tmux", "-S", sock, "has-session", "-t", sessionName)
+	if out, err := check.CombinedOutput(); err != nil {
+		t.Fatalf("session was not created: %v\n%s", err, string(out))
+	}
+
+	exec.Command("tmux", "-S", sock, "kill-session", "-t", sessionName).Run()
+}
+
+// ── createConfigSession tests (F3) ────────────────────────────────────────
+
+// TestCreateConfigSession_OneWindow verifies that a single-window config
+// issues exactly one new-session call with the right window name.
+// Note: tryCreatePiWindow is also called, adding a second new-window for "pi".
+func TestCreateConfigSession_OneWindow(t *testing.T) {
+	mockDir := t.TempDir()
+	logPath := createRecordingMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+	t.Setenv("TMUX_LOG", logPath)
+
+	sock := filepath.Join(t.TempDir(), "test.sock")
+	sessionName := "test-session"
+	workDir := t.TempDir()
+	tmuxConfig := TmuxConfig{
+		"dev": {Command: "npm run dev", Env: map[string]string{"PORT": "3000"}},
+	}
+
+	createConfigSession(sock, sessionName, workDir, tmuxConfig)
+
+	// Read the log and verify
+	invocations := readMockTmuxLog(t, logPath)
+
+	// Filter to new-session and new-window calls (skip set-options etc.)
+	var newSessionCalls, newWindowCalls []mockTmuxCall
+	for _, inv := range invocations {
+		switch inv.Op {
+		case "new-session":
+			newSessionCalls = append(newSessionCalls, inv)
+		case "new-window":
+			newWindowCalls = append(newWindowCalls, inv)
+		}
+	}
+
+	// Single config window: 1 new-session for "dev"
+	// Plus tryCreatePiWindow adds 1 new-window for "pi" (since "pi" not in config)
+	if len(newSessionCalls) != 1 {
+		t.Errorf("got %d new-session calls, want 1", len(newSessionCalls))
+	}
+	if len(newWindowCalls) != 1 {
+		t.Errorf("got %d new-window calls, want 1 (pi auto-window)", len(newWindowCalls))
+	}
+
+	// Verify the new-session has the right window name and command
+	if len(newSessionCalls) == 1 {
+		nc := newSessionCalls[0]
+		if nc.Name != "dev" {
+			t.Errorf("new-session window name = %q, want 'dev'", nc.Name)
+		}
+		if !strings.Contains(nc.Cmd, "npm run dev") {
+			t.Errorf("new-session command missing 'npm run dev': %q", nc.Cmd)
+		}
+		if !strings.Contains(nc.Cmd, `export PORT="3000"`) {
+			t.Errorf("new-session command missing env export: %q", nc.Cmd)
+		}
+	}
+}
+
+// TestCreateConfigSession_MultipleWindows verifies that a 3-window config
+// issues 1 new-session + 2 new-window calls in sorted key order.
+// Plus tryCreatePiWindow adds 1 more new-window for "pi".
+func TestCreateConfigSession_MultipleWindows(t *testing.T) {
+	mockDir := t.TempDir()
+	logPath := createRecordingMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+	t.Setenv("TMUX_LOG", logPath)
+
+	sock := filepath.Join(t.TempDir(), "test.sock")
+	sessionName := "test-session"
+	workDir := t.TempDir()
+	tmuxConfig := TmuxConfig{
+		"dev":   {Command: "npm run dev"},
+		"misc":  {Command: "bash"},
+		"build": {Command: "npm run build"},
+	}
+
+	createConfigSession(sock, sessionName, workDir, tmuxConfig)
+
+	invocations := readMockTmuxLog(t, logPath)
+
+	var newSessionCalls, newWindowCalls []mockTmuxCall
+	for _, inv := range invocations {
+		switch inv.Op {
+		case "new-session":
+			newSessionCalls = append(newSessionCalls, inv)
+		case "new-window":
+			newWindowCalls = append(newWindowCalls, inv)
+		}
+	}
+
+	if len(newSessionCalls) != 1 {
+		t.Errorf("got %d new-session calls, want 1", len(newSessionCalls))
+	}
+	// 2 for the remaining config keys (dev, misc) + 1 for the auto-pi window
+	if len(newWindowCalls) != 3 {
+		t.Errorf("got %d new-window calls, want 3 (2 config + 1 pi)", len(newWindowCalls))
+	}
+
+	// First key (sorted) should be "build" for the new-session
+	if len(newSessionCalls) == 1 && newSessionCalls[0].Name != "build" {
+		t.Errorf("first window (new-session) = %q, want 'build' (sorted first)", newSessionCalls[0].Name)
+	}
+
+	// New-window calls should include "dev", "misc", and "pi"
+	gotNewWindowNames := []string{}
+	for _, nw := range newWindowCalls {
+		gotNewWindowNames = append(gotNewWindowNames, nw.Name)
+	}
+	sort.Strings(gotNewWindowNames)
+	wantNames := []string{"dev", "misc", "pi"}
+	if len(gotNewWindowNames) != len(wantNames) {
+		t.Errorf("new-window names = %v, want %v", gotNewWindowNames, wantNames)
+	}
+	for i, want := range wantNames {
+		if i < len(gotNewWindowNames) && gotNewWindowNames[i] != want {
+			t.Errorf("new-window[%d] name = %q, want %q", i, gotNewWindowNames[i], want)
+		}
+	}
+}
+
+// TestCreateConfigSession_PiWindowSkippedWhenInConfig verifies that when "pi"
+// is in the config, tryCreatePiWindow is NOT called (so we don't get a
+// duplicate "pi" window).
+func TestCreateConfigSession_PiWindowSkippedWhenInConfig(t *testing.T) {
+	mockDir := t.TempDir()
+	logPath := createRecordingMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+	t.Setenv("TMUX_LOG", logPath)
+
+	sock := filepath.Join(t.TempDir(), "test.sock")
+	sessionName := "test-session"
+	workDir := t.TempDir()
+	tmuxConfig := TmuxConfig{
+		"dev": {Command: "npm run dev"},
+		"pi":  {Command: "pi"},
+	}
+
+	createConfigSession(sock, sessionName, workDir, tmuxConfig)
+
+	invocations := readMockTmuxLog(t, logPath)
+
+	// Count how many times "pi" appears as a window name
+	piCount := 0
+	for _, inv := range invocations {
+		if inv.Name == "pi" {
+			piCount++
+		}
+	}
+	if piCount != 1 {
+		t.Errorf("'pi' window appeared %d times, want 1 (should be skipped by tryCreatePiWindow)", piCount)
+	}
+}
+
+// ── F6 tests: select-window behavior ─────────────────────────────────────
+
+// TestCreateConfigSession_DoesNotSelectPi verifies the F6 fix: when the
+// user has config-defined windows, the auto-pi window is created but NOT
+// selected. The active window remains the last user-defined window.
+func TestCreateConfigSession_DoesNotSelectPi(t *testing.T) {
+	mockDir := t.TempDir()
+	logPath := createRecordingMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+	t.Setenv("TMUX_LOG", logPath)
+
+	// Need a "pi" command in PATH for tryCreatePiWindow to do anything.
+	// Create a stub pi binary.
+	piPath := filepath.Join(mockDir, "pi")
+	if err := os.WriteFile(piPath, []byte("#!/bin/sh\necho pi\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	sock := filepath.Join(t.TempDir(), "test.sock")
+	sessionName := "test-session"
+	workDir := t.TempDir()
+	tmuxConfig := TmuxConfig{
+		"dev": {Command: "npm run dev"},
+	}
+
+	createConfigSession(sock, sessionName, workDir, tmuxConfig)
+
+	invocations := readMockTmuxLog(t, logPath)
+
+	// Count select-window calls — should be ZERO
+	selectCount := 0
+	for _, inv := range invocations {
+		if inv.Op == "select-window" {
+			selectCount++
+		}
+	}
+	if selectCount != 0 {
+		t.Errorf("F6 REGRESSION: createConfigSession issued %d select-window calls, want 0 (should not override user's window)", selectCount)
+	}
+}
+
+// TestCreateMinimalSession_SelectsPi verifies that in the minimal-session
+// case (no user config), the pi window IS selected so the user lands on it.
+func TestCreateMinimalSession_SelectsPi(t *testing.T) {
+	mockDir := t.TempDir()
+	logPath := createRecordingMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+	t.Setenv("TMUX_LOG", logPath)
+
+	// Stub pi command
+	piPath := filepath.Join(mockDir, "pi")
+	if err := os.WriteFile(piPath, []byte("#!/bin/sh\necho pi\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	sock := filepath.Join(t.TempDir(), "test.sock")
+	sessionName := "test-session"
+	workDir := t.TempDir()
+
+	createMinimalSession(sock, sessionName, workDir)
+
+	invocations := readMockTmuxLog(t, logPath)
+
+	// Should have a select-window call. The target name (pi) is in the
+	// "cmd" field because the recording mock doesn't parse -t, but the
+	// op is what matters.
+	hasSelect := false
+	for _, inv := range invocations {
+		if inv.Op == "select-window" {
+			hasSelect = true
+			break
+		}
+	}
+	if !hasSelect {
+		t.Error("createMinimalSession should select the pi window (no user config to override)")
+	}
+}
+
+// TestCreateMinimalSession_NoSelectWhenPiMissing verifies the edge case:
+// if pi is not in PATH, no select-window is issued (nothing to select).
+func TestCreateMinimalSession_NoSelectWhenPiMissing(t *testing.T) {
+	mockDir := t.TempDir()
+	logPath := createRecordingMockTmux(t, mockDir)
+	// PATH contains ONLY mockDir (not the real PATH), so the real
+	// "pi" binary (if any) cannot be found.
+	t.Setenv("PATH", mockDir)
+	t.Setenv("TMUX_LOG", logPath)
+
+	sock := filepath.Join(t.TempDir(), "test.sock")
+	sessionName := "test-session"
+	workDir := t.TempDir()
+
+	createMinimalSession(sock, sessionName, workDir)
+
+	invocations := readMockTmuxLog(t, logPath)
+
+	// No select-window should be issued (nothing to select)
+	for _, inv := range invocations {
+		if inv.Op == "select-window" {
+			t.Errorf("select-window was issued even though pi is not in PATH: %+v", inv)
+		}
+	}
+}
+
+// mockTmuxCall is a single invocation recorded by the recording mock tmux.
+type mockTmuxCall struct {
+	Op   string `json:"op"`
+	Name string `json:"name"`
+	Cmd  string `json:"cmd"`
+}
+
+// readMockTmuxLog reads the JSONL log file and returns the parsed invocations.
+func readMockTmuxLog(t *testing.T, path string) []mockTmuxCall {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("readMockTmuxLog: failed to read log: %v", err)
+	}
+	var calls []mockTmuxCall
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var c mockTmuxCall
+		if err := json.Unmarshal([]byte(line), &c); err != nil {
+			t.Logf("skipping unparseable line: %q (err: %v)", line, err)
+			continue
+		}
+		calls = append(calls, c)
+	}
+	return calls
 }
 
 // ── Unit 4: Command handlers ────────────────────────────────────────────
@@ -559,6 +1698,87 @@ exit 0
 	}
 }
 
+// createRecordingMockTmux writes a mock tmux that records each invocation
+// as a JSONL line in $TMUX_LOG. The recorder parses common tmux flags so
+// tests can verify the right number of new-session vs new-window calls were
+// issued and with the right window names / commands.
+//
+// The recorder stops at the first `;` (tmux sub-command separator) so it
+// only logs the window-creation op, not the trailing set-option commands
+// that new-session chains.
+//
+// Returns the path to the log file.
+func createRecordingMockTmux(t *testing.T, dir string) string {
+	t.Helper()
+	tmuxPath := filepath.Join(dir, "tmux")
+	logPath := filepath.Join(dir, "tmux.log")
+	content := `#!/bin/sh
+# Recording mock tmux — logs new-session/new-window invocations to $TMUX_LOG
+sock=""
+op=""
+win_name=""
+cmd=""
+mode=""
+
+for arg in "$@"; do
+    if [ "$arg" = ";" ]; then
+        break  # stop at first tmux sub-command separator
+    fi
+    case "$arg" in
+        -S) mode="sock" ;;
+        -n) mode="name" ;;
+        -c) mode="dir_skip" ;;
+        -d) mode="skip_one" ;;  # -d is a standalone flag
+        -s) mode="skip_one" ;;  # -s takes a value (session name)
+        new-session) op="new-session" ;;
+        new-window) op="new-window" ;;
+        has-session|kill-session|attach-session) op="$arg" ;;
+        set-option|select-window|send-keys) op="$arg" ;;
+        *)
+            case "$mode" in
+                sock) sock="$arg"; mode="" ;;
+                name) win_name="$arg"; mode="" ;;
+                dir_skip) mode="" ;;
+                skip_one) mode="" ;;
+                *) cmd="$arg" ;;  # the free arg = command
+            esac
+            ;;
+    esac
+done
+
+# Set up the socket file
+if [ -n "$sock" ]; then
+    mkdir -p "$(dirname "$sock")"
+    # has-session: exit 0 if sock exists, 1 if not
+    if [ "$op" = "has-session" ]; then
+        if [ -f "$sock" ]; then
+            exit 0
+        else
+            exit 1
+        fi
+    fi
+    # Other ops that need the sock: create it
+    if [ "$op" = "new-session" ] || [ "$op" = "new-window" ] || [ "$op" = "kill-session" ]; then
+        touch "$sock"
+    fi
+fi
+
+# Only log window-creation operations AND select-window (for F6 testing)
+if [ "$op" = "new-session" ] || [ "$op" = "new-window" ] || [ "$op" = "select-window" ]; then
+    if [ -n "$TMUX_LOG" ]; then
+        esc_cmd=$(printf '%s' "$cmd" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g')
+        printf '{"op":"%s","name":"%s","cmd":"%s"}\n' "$op" "$win_name" "$esc_cmd" >> "$TMUX_LOG"
+    fi
+fi
+
+exit 0
+`
+	if err := os.WriteFile(tmuxPath, []byte(content), 0755); err != nil {
+		t.Fatal(err)
+	}
+	return logPath
+}
+
 func TestHandleWorktreeList(t *testing.T) {
 	if !isGitRepo() {
 		t.Skip("not in a git repository")
@@ -609,6 +1829,319 @@ func TestHandleWorktreeOpen(t *testing.T) {
 			}
 		case <-time.After(10 * time.Second):
 			t.Fatal("handleWorktreeOpen timed out")
+		}
+	})
+}
+
+// ── M2: TestHandleWorktreeOpen_WithConfig ────────────────────────────────
+//
+// This test exercises the FULL config-driven open path. It is the regression
+// test for the F1 bug (port re-allocation on open) and also verifies:
+//   - Setup commands run on open
+//   - Proxy is registered with the ORIGINAL port (not a re-allocated one)
+//   - Tmux session is created with config-driven windows
+//   - Setup_oneshot=true prevents re-running setup on subsequent opens
+//
+// The test pre-populates the persisted port state with a specific port
+// (12345) so we can verify the F1 invariant: open reuses the original port.
+
+// TestHandleWorktreeOpen_WithConfig_F1Regression is the M2 + F1 regression test.
+// It verifies that aru worktree open re-uses the port allocated by
+// `aru worktree add` (stored in the state file), rather than allocating a new one.
+func TestHandleWorktreeOpen_WithConfig_F1Regression(t *testing.T) {
+	// Override HOME so all state/proxy files go to a temp dir
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	dir := t.TempDir()
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "feature-f1")
+
+	// Mock tmux (recording)
+	mockDir := t.TempDir()
+	logPath := createRecordingMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+	t.Setenv("TMUX_LOG", logPath)
+
+	runInDir(t, dir, func() {
+		project := filepath.Base(dir)
+		target := worktreeDir(project, "feature-f1")
+		originalPort := 12345
+
+		// Create the worktree
+		if err := gitWorktreeAdd(target, "feature-f1"); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(target) })
+
+		// Create ram path and data symlink (mimicking what add would do)
+		ramPath := ramDir(project, "feature-f1")
+		if err := os.MkdirAll(ramPath, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := setupDataSymlink(target, ramPath); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create aru.json in the worktree with port placeholders
+		setupMarker := filepath.Join(target, "setup-ran")
+		// Note: proxy name must pass validateName (no dots, no reserved words).
+		// Use a name that's derived from the branch so we can verify reuse.
+		aruJSON := `{
+			"worktree": {
+				"setup": ["touch ` + setupMarker + `"]
+			},
+			"tmux": {
+				"dev": {"command": "npm run dev", "env": {"PORT": "<PORT1>"}}
+			},
+			"proxy": {
+				"name": "feature-f1-app",
+				"port": "<PORT1>"
+			}
+		}`
+		if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Pre-populate the port state file (simulating what `aru worktree add` would have done)
+		if err := persistAllocatedPorts(project, "feature-f1", map[int]int{1: originalPort}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			removeAllocatedPorts(project, "feature-f1")
+			clearSetupComplete(project, "feature-f1")
+		})
+
+		// Call handleWorktreeOpen in a goroutine (it blocks on tmux attach)
+		errCh := make(chan error, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errCh <- fmt.Errorf("panic: %v", r)
+				}
+			}()
+			handleWorktreeOpen("feature-f1")
+			errCh <- nil
+		}()
+
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("handleWorktreeOpen returned error: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("handleWorktreeOpen timed out")
+		}
+
+		// ── Verifications ──
+
+		// (1) Setup command ran
+		if _, err := os.Stat(setupMarker); os.IsNotExist(err) {
+			t.Error("setup command did not run")
+		}
+
+		// (2) F1 REGRESSION: proxy was registered with the ORIGINAL port,
+		//     not a re-allocated one.
+		dbPath := defaultProxyDBPath()
+		db, err := LoadProxyDB(dbPath)
+		if err != nil {
+			t.Fatalf("LoadProxyDB failed: %v", err)
+		}
+		port, ok := db.Get("feature-f1-app")
+		if !ok {
+			t.Fatal("proxy was not registered")
+		}
+		if port != originalPort {
+			t.Errorf("F1 REGRESSION: proxy port = %d, want %d (should reuse original port from state file)", port, originalPort)
+		}
+
+		// (3) Tmux session was created with the config-defined window
+		invocations := readMockTmuxLog(t, logPath)
+		hasDevWindow := false
+		for _, inv := range invocations {
+			if inv.Op == "new-session" && inv.Name == "dev" {
+				hasDevWindow = true
+				// Verify the command references the port env var
+				if !strings.Contains(inv.Cmd, "npm run dev") {
+					t.Errorf("dev window command missing 'npm run dev': %q", inv.Cmd)
+				}
+				if !strings.Contains(inv.Cmd, `export PORT="`) {
+					t.Errorf("dev window command missing PORT env export: %q", inv.Cmd)
+				}
+			}
+		}
+		if !hasDevWindow {
+			t.Error("tmux session did not have the config-defined 'dev' window")
+		}
+	})
+}
+
+// TestHandleWorktreeOpen_WithConfig_SetupOneshot verifies that with
+// `setup_oneshot: true` and a pre-existing marker, setup does NOT run
+// on subsequent opens.
+func TestHandleWorktreeOpen_WithConfig_SetupOneshot(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	dir := t.TempDir()
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "feature-oneshot")
+
+	mockDir := t.TempDir()
+	createMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	runInDir(t, dir, func() {
+		project := filepath.Base(dir)
+		target := worktreeDir(project, "feature-oneshot")
+		originalPort := 23456
+
+		if err := gitWorktreeAdd(target, "feature-oneshot"); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(target) })
+
+		ramPath := ramDir(project, "feature-oneshot")
+		if err := os.MkdirAll(ramPath, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := setupDataSymlink(target, ramPath); err != nil {
+			t.Fatal(err)
+		}
+
+		setupMarker := filepath.Join(target, "setup-ran")
+		aruJSON := `{
+			"worktree": {
+				"setup": ["touch ` + setupMarker + `"],
+				"setup_oneshot": true
+			}
+		}`
+		if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Pre-populate port state AND the setup-complete marker
+		if err := persistAllocatedPorts(project, "feature-oneshot", map[int]int{1: originalPort}); err != nil {
+			t.Fatal(err)
+		}
+		if err := markSetupComplete(project, "feature-oneshot"); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			removeAllocatedPorts(project, "feature-oneshot")
+			clearSetupComplete(project, "feature-oneshot")
+		})
+
+		// Call open — setup should be SKIPPED because the marker exists
+		errCh := make(chan error, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errCh <- fmt.Errorf("panic: %v", r)
+				}
+			}()
+			handleWorktreeOpen("feature-oneshot")
+			errCh <- nil
+		}()
+
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("handleWorktreeOpen returned error: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("handleWorktreeOpen timed out")
+		}
+
+		// M1 invariant: setup did NOT run (marker file should not exist)
+		if _, err := os.Stat(setupMarker); !os.IsNotExist(err) {
+			t.Error("setup should not have run (setup_oneshot=true and marker exists)")
+		}
+	})
+}
+
+// TestHandleWorktreeOpen_WithConfig_SetupOneshot_RunsFirstTime verifies that
+// when `setup_oneshot: true` is set but the marker does NOT exist, setup runs
+// AND the marker is written for subsequent opens.
+func TestHandleWorktreeOpen_WithConfig_SetupOneshot_RunsFirstTime(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	dir := t.TempDir()
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "feature-first")
+
+	mockDir := t.TempDir()
+	createMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	runInDir(t, dir, func() {
+		project := filepath.Base(dir)
+		target := worktreeDir(project, "feature-first")
+		originalPort := 34567
+
+		if err := gitWorktreeAdd(target, "feature-first"); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(target) })
+
+		ramPath := ramDir(project, "feature-first")
+		if err := os.MkdirAll(ramPath, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := setupDataSymlink(target, ramPath); err != nil {
+			t.Fatal(err)
+		}
+
+		setupMarker := filepath.Join(target, "setup-ran")
+		aruJSON := `{
+			"worktree": {
+				"setup": ["touch ` + setupMarker + `"],
+				"setup_oneshot": true
+			}
+		}`
+		if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Pre-populate port state but NOT the setup marker
+		if err := persistAllocatedPorts(project, "feature-first", map[int]int{1: originalPort}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			removeAllocatedPorts(project, "feature-first")
+			clearSetupComplete(project, "feature-first")
+		})
+
+		// Call open
+		errCh := make(chan error, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errCh <- fmt.Errorf("panic: %v", r)
+				}
+			}()
+			handleWorktreeOpen("feature-first")
+			errCh <- nil
+		}()
+
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("handleWorktreeOpen returned error: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("handleWorktreeOpen timed out")
+		}
+
+		// Setup should have run
+		if _, err := os.Stat(setupMarker); os.IsNotExist(err) {
+			t.Error("setup should have run on first open (no marker present)")
+		}
+
+		// Marker should now exist
+		if !isSetupComplete(project, "feature-first") {
+			t.Error("setup-complete marker should be written after first run")
 		}
 	})
 }

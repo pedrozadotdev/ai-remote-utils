@@ -17,8 +17,8 @@ go build -o ai-remote-utils .
 sudo ./ai-remote-utils
 
 # Or install as a systemd service
-sudo cp ai-remote-utils /usr/local/bin/
-sudo cp ai-remote-utils.service /etc/systemd/system/
+sudo ./ai-remote-utils --install-service
+sudo systemctl daemon-reload
 sudo systemctl enable --now ai-remote-utils
 ```
 

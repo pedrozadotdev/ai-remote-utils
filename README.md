@@ -1,4 +1,4 @@
-# aru
+# ai-remote-utils
 
 A single Go binary that provides local development utilities for AI agent workflows:
 

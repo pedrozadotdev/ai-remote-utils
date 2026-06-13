@@ -72,15 +72,15 @@ func main() {
 			os.Exit(1)
 		}
 
-		fmt.Printf("Service file written to /etc/systemd/system/ai-remote-utils.service\n")
-		fmt.Printf("Run: systemctl daemon-reload && systemctl enable --now ai-remote-utils\n")
+		fmt.Printf("Service file written to /etc/systemd/system/aru.service\n")
+		fmt.Printf("Run: systemctl daemon-reload && systemctl enable --now aru\n")
 		os.Exit(0)
 	}
 
 	// --- Structured logging ---
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	slog.Info("starting ai-remote-utils server",
+	slog.Info("starting aru server",
 		"port", *port,
 		"max_size", *maxSize,
 		"cert_dir", *certDir,
@@ -189,7 +189,7 @@ func main() {
 // handleProxySubcommand dispatches to proxy management subcommands.
 func handleProxySubcommand(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: ai-remote-utils proxy <command> [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: aru proxy <command> [options]\n\n")
 		fmt.Fprintf(os.Stderr, "Commands:\n")
 		fmt.Fprintf(os.Stderr, "  add    Add a proxy entry  (--name=X --port=Y)\n")
 		fmt.Fprintf(os.Stderr, "  del    Delete a proxy entry  (--name=X)\n")
@@ -218,7 +218,7 @@ func handleProxyAdd(args []string) {
 	fs.Parse(args)
 
 	if *name == "" || *port == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: ai-remote-utils proxy add --name=X --port=Y\n")
+		fmt.Fprintf(os.Stderr, "Usage: aru proxy add --name=X --port=Y\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -244,7 +244,7 @@ func handleProxyDel(args []string) {
 	fs.Parse(args)
 
 	if *name == "" {
-		fmt.Fprintf(os.Stderr, "Usage: ai-remote-utils proxy del --name=X\n")
+		fmt.Fprintf(os.Stderr, "Usage: aru proxy del --name=X\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -316,7 +316,7 @@ func lookupEnvStr(key, fallback string) string {
 	return fallback
 }
 
-// defaultCertDir returns the default certificate directory (~/.ai-remote-utils/).
+// defaultCertDir returns the default certificate directory (~/.aru/).
 func defaultCertDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -344,7 +344,7 @@ func checkWritable(dir string) error {
 // with ExecStart and WorkingDirectory set to the given paths.
 func GenerateServiceFile(binPath, workDir string) string {
 	return fmt.Sprintf(`[Unit]
-Description=ai-remote-utils — development utility server
+Description=aru — development utility server
 After=network.target
 
 [Service]
@@ -367,7 +367,7 @@ func InstallService(binPath, workDir, targetDir string) error {
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return fmt.Errorf("failed to create target directory %s: %w", targetDir, err)
 	}
-	servicePath := filepath.Join(targetDir, "ai-remote-utils.service")
+	servicePath := filepath.Join(targetDir, "aru.service")
 	if err := os.WriteFile(servicePath, []byte(content), 0644); err != nil {
 		return fmt.Errorf("failed to write service file %s: %w", servicePath, err)
 	}

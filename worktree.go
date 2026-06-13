@@ -24,19 +24,19 @@ func handleWorktreeSubcommand(args []string) {
 	switch args[0] {
 	case "add":
 		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "Usage: ai-remote-utils worktree add <branch>\n")
+			fmt.Fprintf(os.Stderr, "Usage: aru worktree add <branch>\n")
 			os.Exit(1)
 		}
 		handleWorktreeAdd(args[1])
 	case "del", "d":
 		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "Usage: ai-remote-utils worktree del <branch>\n")
+			fmt.Fprintf(os.Stderr, "Usage: aru worktree del <branch>\n")
 			os.Exit(1)
 		}
 		handleWorktreeDel(args[1])
 	case "open", "o":
 		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "Usage: ai-remote-utils worktree open <branch>\n")
+			fmt.Fprintf(os.Stderr, "Usage: aru worktree open <branch>\n")
 			os.Exit(1)
 		}
 		handleWorktreeOpen(args[1])
@@ -54,7 +54,7 @@ func handleWorktreeSubcommand(args []string) {
 
 // printWorktreeUsage prints the worktree subcommand usage.
 func printWorktreeUsage() {
-	fmt.Fprintf(os.Stderr, `Usage: ai-remote-utils worktree <command> [options]
+	fmt.Fprintf(os.Stderr, `Usage: aru worktree <command> [options]
 
 Commands:
   add <branch>     Create a git worktree at ~/.aru/wt/<project>/<branch> and enter tmux
@@ -150,7 +150,7 @@ func getProjectName() (string, error) {
 
 // ── Path builders ────────────────────────────────────────────────────────────
 
-// baseDir returns the base directory for all ai-remote-utils data (~/.aru).
+// baseDir returns the base directory for all aru data (~/.aru).
 func baseDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {

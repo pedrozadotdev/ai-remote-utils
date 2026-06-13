@@ -39,8 +39,8 @@ func generateCertWithValidity(validity time.Duration) (certPEM, keyPEM []byte, e
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization: []string{"ai-remote-utils"},
-			CommonName:   "ai-remote-utils",
+			Organization: []string{"aru"},
+			CommonName:   "aru",
 		},
 		NotBefore:             now,
 		NotAfter:              now.Add(validity),

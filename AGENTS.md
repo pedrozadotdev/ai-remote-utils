@@ -1,4 +1,4 @@
-# AGENTS.md — AI Agent Rules for ai-remote-utils
+# AGENTS.md — AI Agent Rules for aru
 
 This file documents conventions, constraints, and skill mappings for AI agents working on this project.
 
@@ -21,7 +21,7 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 | Change main.go wiring | `main.go` — flag parsing, listener orchestration, signal handling |
 | Update frontend UI | `static/index.html` — single embedded HTML file |
 | Add embedded static asset | `static.go` — embed via `//go:embed static` directive |
-| Change systemd service | `ai-remote-utils.service` — unit file |
+| Change systemd service | `aru.service` — unit file |
 | Document a solved problem | `~/.pi/agent/docs/solutions/<category>/` (global solutions) |
 | Mock external commands in tests | `docs/solutions/go-mock-external-commands-testing.md` — PATH manipulation with mock binaries, temp git repos |
 | Review code changes | `docs/reviews/<date>-<topic>.md` using `04-review` skill |
@@ -126,5 +126,5 @@ Global solutions at `~/.pi/agent/docs/solutions/`:
 ## Build
 
 ```bash
-go build -o ai-remote-utils .  # Produces ~10MB static binary
+go build -o aru .  # Produces ~10MB static binary
 ```

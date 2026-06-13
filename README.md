@@ -1,4 +1,4 @@
-# ai-remote-utils
+# aru
 
 A single Go binary that provides local development utilities for AI agent workflows:
 
@@ -13,13 +13,13 @@ A single Go binary that provides local development utilities for AI agent workfl
 
 ```bash
 # Build (requires root for ports <1024)
-go build -o ai-remote-utils .
-sudo ./ai-remote-utils
+go build -o aru .
+sudo ./aru
 
 # Or install as a systemd service
-sudo ./ai-remote-utils --install-service
+sudo ./aru --install-service
 sudo systemctl daemon-reload
-sudo systemctl enable --now ai-remote-utils
+sudo systemctl enable --now aru
 ```
 
 ## Features
@@ -30,16 +30,16 @@ Access any local dev server via a named `https://<name>.test` URL — no more `l
 
 ```bash
 # Add a proxy entry
-ai-remote-utils proxy add --name=myapp --port=3000
+aru proxy add --name=myapp --port=3000
 
 # Now access it
 https://myapp.test/  →  http://localhost:3000/
 
 # List all proxies
-ai-remote-utils proxy list
+aru proxy list
 
 # Remove a proxy
-ai-remote-utils proxy del --name=myapp
+aru proxy del --name=myapp
 ```
 
 - Proxy entries are persisted in `~/.aru/proxies.json` (survives restarts)
@@ -73,16 +73,16 @@ Create isolated git worktrees with tmux sessions and RAM-backed data directories
 
 ```bash
 # Add a worktree for a feature branch (pulls latest, creates worktree, launches tmux)
-ai-remote-utils worktree add my-feature
+aru worktree add my-feature
 
 # Re-attach to an existing worktree's tmux session
-ai-remote-utils worktree open my-feature
+aru worktree open my-feature
 
 # Remove a worktree (cleans up RAM, kills tmux, deletes branch)
-ai-remote-utils worktree del my-feature
+aru worktree del my-feature
 
 # List all worktrees with current directory marker
-ai-remote-utils worktree list
+aru worktree list
 ```
 
 - Worktrees stored at `~/.aru/wt/<project>/<branch>`
@@ -127,19 +127,19 @@ Manage reverse proxy entries without restarting the server:
 
 ```bash
 # Add a named proxy (persisted to ~/.aru/proxies.json)
-ai-remote-utils proxy add --name=myapp --port=3000
+aru proxy add --name=myapp --port=3000
 
 # Delete a proxy
-ai-remote-utils proxy del --name=myapp
+aru proxy del --name=myapp
 
 # List all proxies
-ai-remote-utils proxy list
+aru proxy list
 
 # Worktree management
-ai-remote-utils worktree add my-feature
-ai-remote-utils worktree open my-feature
-ai-remote-utils worktree del my-feature
-ai-remote-utils worktree list
+aru worktree add my-feature
+aru worktree open my-feature
+aru worktree del my-feature
+aru worktree list
 ```
 
 Flags override environment variables. Environment variables override defaults.
@@ -148,17 +148,17 @@ Flags override environment variables. Environment variables override defaults.
 
 ```bash
 # Move binary to final location first
-sudo cp ai-remote-utils /usr/local/bin/
+sudo cp aru /usr/local/bin/
 
 # Install the service (detects binary path and working directory automatically)
-sudo /usr/local/bin/ai-remote-utils --install-service
+sudo /usr/local/bin/aru --install-service
 
 # Then enable and start
 sudo systemctl daemon-reload
-sudo systemctl enable --now ai-remote-utils
+sudo systemctl enable --now aru
 ```
 
-The `--install-service` flag generates the service file at `/etc/systemd/system/ai-remote-utils.service` with the correct `ExecStart` and `WorkingDirectory` paths based on the binary's location.
+The `--install-service` flag generates the service file at `/etc/systemd/system/aru.service` with the correct `ExecStart` and `WorkingDirectory` paths based on the binary's location.
 
 ### API
 

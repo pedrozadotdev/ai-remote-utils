@@ -21,9 +21,9 @@ type Server struct {
 
 // NewServer creates a new Server with virtual host routing.
 // - tmp.test → upload handler + static files (with security headers)
-// - <port>.test → reverse proxy (without security headers)
+// - <name>.test → reverse proxy via ProxyDB (without security headers)
 // - anything else → 404
-func NewServer(maxSize int64, uploadDir string, certPEM, keyPEM []byte) *Server {
+func NewServer(maxSize int64, uploadDir string, certPEM, keyPEM []byte, proxyDB *ProxyDB) *Server {
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		slog.Error("failed to parse TLS certificate", "error", err)
@@ -64,9 +64,14 @@ func NewServer(maxSize int64, uploadDir string, certPEM, keyPEM []byte) *Server 
 
 	// Reverse proxy handler (no security headers)
 	proxyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		port, ok := ParseTestSubdomain(r.Host)
+		// Hot-reload: check if proxy DB file changed externally
+		if proxyDB != nil {
+			proxyDB.Refresh()
+		}
+
+		port, ok := LookupProxy(r.Host, proxyDB)
 		if !ok {
-			http.Error(w, "Bad Request: invalid test subdomain", http.StatusBadRequest)
+			http.Error(w, "Not Found: unknown proxy target", http.StatusNotFound)
 			return
 		}
 		proxy := NewReverseProxy(port)

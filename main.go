@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -23,6 +25,12 @@ const (
 )
 
 func main() {
+	// Check for proxy subcommand before parsing server flags
+	if len(os.Args) > 1 && os.Args[1] == "proxy" {
+		handleProxySubcommand(os.Args[2:])
+		return
+	}
+
 	// --- Flag parsing ---
 	port := flag.Int("port", lookupEnvInt("PORT", defaultPort), "HTTPS server port")
 	maxSize := flag.Int("max-size", lookupEnvInt("MAX_UPLOAD_SIZE", defaultMaxSize), "Maximum upload file size in bytes")
@@ -101,6 +109,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// --- Load proxy database ---
+	proxyDBPath := filepath.Join(*certDir, "proxies.json")
+	proxyDB, err := LoadProxyDB(proxyDBPath)
+	if err != nil {
+		slog.Error("failed to load proxy database", "path", proxyDBPath, "error", err)
+		os.Exit(1)
+	}
+	slog.Info("loaded proxy database", "path", proxyDBPath, "entries", proxyDB.Len())
+
 	// --- Create context with signal handling ---
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -115,7 +132,7 @@ func main() {
 	StartRedirect(ctx)
 
 	// --- Create HTTPS server ---
-	srv := NewServer(int64(*maxSize), *uploadDir, certPEM, keyPEM)
+	srv := NewServer(int64(*maxSize), *uploadDir, certPEM, keyPEM, proxyDB)
 	if srv == nil {
 		slog.Error("failed to create server")
 		os.Exit(1)
@@ -161,6 +178,118 @@ func main() {
 	}
 
 	slog.Info("server stopped")
+}
+
+// handleProxySubcommand dispatches to proxy management subcommands.
+func handleProxySubcommand(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: ai-remote-utils proxy <command> [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Commands:\n")
+		fmt.Fprintf(os.Stderr, "  add    Add a proxy entry  (--name=X --port=Y)\n")
+		fmt.Fprintf(os.Stderr, "  del    Delete a proxy entry  (--name=X)\n")
+		fmt.Fprintf(os.Stderr, "  list   List all proxy entries\n")
+		os.Exit(1)
+	}
+
+	switch args[0] {
+	case "add":
+		handleProxyAdd(args[1:])
+	case "del":
+		handleProxyDel(args[1:])
+	case "list":
+		handleProxyList()
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown proxy command: %q\n", args[0])
+		fmt.Fprintf(os.Stderr, "Available: add, del, list\n")
+		os.Exit(1)
+	}
+}
+
+func handleProxyAdd(args []string) {
+	fs := flag.NewFlagSet("add", flag.ExitOnError)
+	name := fs.String("name", "", "Proxy name (e.g., myapp)")
+	port := fs.Int("port", 0, "Target port (e.g., 3000)")
+	fs.Parse(args)
+
+	if *name == "" || *port == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: ai-remote-utils proxy add --name=X --port=Y\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	dbPath := defaultProxyDBPath()
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading proxy DB: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := db.Add(*name, *port); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Proxy '%s' added → localhost:%d\n", *name, *port)
+}
+
+func handleProxyDel(args []string) {
+	fs := flag.NewFlagSet("del", flag.ExitOnError)
+	name := fs.String("name", "", "Proxy name to delete")
+	fs.Parse(args)
+
+	if *name == "" {
+		fmt.Fprintf(os.Stderr, "Usage: ai-remote-utils proxy del --name=X\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	dbPath := defaultProxyDBPath()
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading proxy DB: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := db.Delete(*name); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Proxy '%s' deleted\n", *name)
+}
+
+func handleProxyList() {
+	dbPath := defaultProxyDBPath()
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading proxy DB: %v\n", err)
+		os.Exit(1)
+	}
+
+	entries := db.List()
+	if len(entries) == 0 {
+		fmt.Println("No proxy entries configured.")
+		return
+	}
+
+	// Sort by name for consistent output
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	fmt.Printf("%-30s %s\n", "NAME", "PORT")
+	fmt.Println(strings.Repeat("-", 38))
+	for _, name := range names {
+		fmt.Printf("%-30s %d\n", name, entries[name])
+	}
+	fmt.Printf("\n%d proxy entr%s\n", len(entries), map[bool]string{true: "y", false: "ies"}[len(entries) == 1])
+}
+
+// defaultProxyDBPath returns the default path for the proxy database JSON file.
+func defaultProxyDBPath() string {
+	return filepath.Join(defaultCertDir(), "proxies.json")
 }
 
 // lookupEnvInt returns the integer value of the environment variable, or fallback.

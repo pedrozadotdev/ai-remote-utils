@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -53,8 +54,9 @@ func doPost(t *testing.T, addr, host, path string, contentType string, body io.R
 	return resp
 }
 
-// setupTestServer creates a test server and returns its address and cert/key.
-func setupTestServer(t *testing.T) (string, *Server, []byte, []byte) {
+// setupTestServer creates a test server with an empty ProxyDB.
+// Returns the address, server, cert PEM, key PEM, and a writeable ProxyDB.
+func setupTestServer(t *testing.T) (string, *Server, []byte, []byte, *ProxyDB) {
 	t.Helper()
 	certDir := t.TempDir()
 	if err := EnsureCert(certDir); err != nil {
@@ -69,13 +71,19 @@ func setupTestServer(t *testing.T) (string, *Server, []byte, []byte) {
 		t.Fatalf("failed to read key.pem: %v", err)
 	}
 
-	srv := NewServer(1024*1024, t.TempDir(), certPEM, keyPEM)
+	proxyDBPath := filepath.Join(t.TempDir(), "proxies.json")
+	proxyDB, err := LoadProxyDB(proxyDBPath)
+	if err != nil {
+		t.Fatalf("LoadProxyDB error = %v", err)
+	}
+
+	srv := NewServer(1024*1024, t.TempDir(), certPEM, keyPEM, proxyDB)
 	addr := startServer(t, srv)
-	return addr, srv, certPEM, keyPEM
+	return addr, srv, certPEM, keyPEM, proxyDB
 }
 
 func TestServer_TmpTest_GetRoot(t *testing.T) {
-	addr, srv, _, _ := setupTestServer(t)
+	addr, srv, _, _, _ := setupTestServer(t)
 	defer srv.Close()
 
 	resp := doGet(t, addr, "tmp.test", "/")
@@ -91,7 +99,7 @@ func TestServer_TmpTest_GetRoot(t *testing.T) {
 }
 
 func TestServer_TmpTest_PostUpload(t *testing.T) {
-	addr, srv, _, _ := setupTestServer(t)
+	addr, srv, _, _, _ := setupTestServer(t)
 	defer srv.Close()
 
 	body := &bytes.Buffer{}
@@ -112,7 +120,7 @@ func TestServer_TmpTest_PostUpload(t *testing.T) {
 }
 
 func TestServer_TmpTest_PostUploadNoFile(t *testing.T) {
-	addr, srv, _, _ := setupTestServer(t)
+	addr, srv, _, _, _ := setupTestServer(t)
 	defer srv.Close()
 
 	body := &bytes.Buffer{}
@@ -128,7 +136,7 @@ func TestServer_TmpTest_PostUploadNoFile(t *testing.T) {
 }
 
 func TestServer_GracefulShutdown(t *testing.T) {
-	addr, srv, _, _ := setupTestServer(t)
+	addr, srv, _, _, _ := setupTestServer(t)
 
 	// Verify server is responding via tmp.test
 	resp := doGet(t, addr, "tmp.test", "/")
@@ -149,7 +157,7 @@ func TestServer_GracefulShutdown(t *testing.T) {
 }
 
 func TestServer_UploadDirCreated(t *testing.T) {
-	_, srv, _, _ := setupTestServer(t)
+	_, srv, _, _, _ := setupTestServer(t)
 	defer srv.Close()
 
 	// Dir should exist (NewServer doesn't create it, but the test setup does)
@@ -159,7 +167,7 @@ func TestServer_UploadDirCreated(t *testing.T) {
 }
 
 func TestServer_LocalhostReturns404(t *testing.T) {
-	addr, srv, _, _ := setupTestServer(t)
+	addr, srv, _, _, _ := setupTestServer(t)
 	defer srv.Close()
 
 	resp := doGet(t, addr, "localhost", "/")
@@ -171,7 +179,7 @@ func TestServer_LocalhostReturns404(t *testing.T) {
 }
 
 func TestServer_LocalhostIPReturns404(t *testing.T) {
-	addr, srv, _, _ := setupTestServer(t)
+	addr, srv, _, _, _ := setupTestServer(t)
 	defer srv.Close()
 
 	resp := doGet(t, addr, "127.0.0.1", "/")
@@ -183,7 +191,7 @@ func TestServer_LocalhostIPReturns404(t *testing.T) {
 }
 
 func TestServer_UnknownHostReturns404(t *testing.T) {
-	addr, srv, _, _ := setupTestServer(t)
+	addr, srv, _, _, _ := setupTestServer(t)
 	defer srv.Close()
 
 	resp := doGet(t, addr, "unknown.example.com", "/")
@@ -195,7 +203,7 @@ func TestServer_UnknownHostReturns404(t *testing.T) {
 }
 
 func TestServer_TmpTest_HasSecurityHeaders(t *testing.T) {
-	addr, srv, _, _ := setupTestServer(t)
+	addr, srv, _, _, _ := setupTestServer(t)
 	defer srv.Close()
 
 	resp := doGet(t, addr, "tmp.test", "/")
@@ -227,14 +235,18 @@ func TestServer_ProxyRoute(t *testing.T) {
 	defer upstream.Close()
 	time.Sleep(20 * time.Millisecond)
 
-	addr, srv, _, _ := setupTestServer(t)
+	addr, srv, _, _, proxyDB := setupTestServer(t)
 	defer srv.Close()
 
-	// Extract port from upstream
+	// Extract port from upstream and add as a named proxy entry
 	_, portStr, _ := net.SplitHostPort(upstream.Addr)
+	upstreamPort, _ := strconv.Atoi(portStr)
+	if err := proxyDB.Add("myapp", upstreamPort); err != nil {
+		t.Fatalf("proxyDB.Add error = %v", err)
+	}
 
-	// Request via proxy route
-	resp := doGet(t, addr, portStr+".test", "/")
+	// Request via named proxy route
+	resp := doGet(t, addr, "myapp.test", "/")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -246,16 +258,61 @@ func TestServer_ProxyRoute(t *testing.T) {
 	}
 }
 
-func TestServer_ProxyRoute_NonExistent(t *testing.T) {
-	addr, srv, _, _ := setupTestServer(t)
+func TestServer_ProxyRoute_UnknownName(t *testing.T) {
+	addr, srv, _, _, _ := setupTestServer(t)
 	defer srv.Close()
 
-	resp := doGet(t, addr, "39999.test", "/")
+	// Request via unknown proxy name → 404
+	resp := doGet(t, addr, "nonexistent.test", "/")
 	defer resp.Body.Close()
 
-	// Should get 502 (unreachable) not 200
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Errorf("expected 502 for unreachable proxy, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown proxy name, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_ProxyRoute_TmpReserved(t *testing.T) {
+	addr, srv, _, _, _ := setupTestServer(t)
+	defer srv.Close()
+
+	// "tmp" is reserved for the upload handler, not a proxy target
+	resp := doGet(t, addr, "tmp.test", "/")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for tmp.test (upload handler), got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_ProxyRoute_WithPortSuffix(t *testing.T) {
+	// Start an upstream server
+	upstream := http.Server{Addr: "127.0.0.1:0"}
+	upstream.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("upstream-ok"))
+	})
+	upstreamListener, err := net.Listen("tcp", upstream.Addr)
+	if err != nil {
+		t.Fatalf("upstream listen error: %v", err)
+	}
+	upstream.Addr = upstreamListener.Addr().String()
+	go upstream.Serve(upstreamListener)
+	defer upstream.Close()
+	time.Sleep(20 * time.Millisecond)
+
+	addr, srv, _, _, proxyDB := setupTestServer(t)
+	defer srv.Close()
+
+	_, portStr, _ := net.SplitHostPort(upstream.Addr)
+	upstreamPort, _ := strconv.Atoi(portStr)
+	proxyDB.Add("myapp", upstreamPort)
+
+	// Request with :443 port suffix appended (as the real TLS listener does)
+	resp := doGet(t, addr, "myapp.test", "/")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for myapp.test with port suffix, got %d", resp.StatusCode)
 	}
 }
 

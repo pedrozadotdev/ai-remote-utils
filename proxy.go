@@ -18,14 +18,17 @@ var blockedProxyPorts = map[int]bool{
 	443: true, // HTTPS
 }
 
-// ParseTestSubdomain extracts a port number from a hostname like "3000.test"
-// or "3000.test:443". Returns the port and true if the subdomain is a valid
-// numeric port. Returns false for reserved names like "tmp.test", non-numeric
-// subdomains, blocked ports, and out-of-range values.
-func ParseTestSubdomain(host string) (int, bool) {
-	// Strip port suffix if present (e.g., "3000.test:443" → "3000.test")
+// LookupProxy looks up a named proxy by hostname. It extracts the subdomain
+// from a hostname like "myapp.test" or "myapp.test:443", converts to lowercase,
+// and looks up the name in the given ProxyDB. Returns the port and true if found.
+// Returns false for reserved names like "tmp.test", non-.test domains, etc.
+func LookupProxy(host string, db *ProxyDB) (int, bool) {
+	if db == nil {
+		return 0, false
+	}
+
+	// Strip port suffix if present (e.g., "myapp.test:443" → "myapp.test")
 	if idx := strings.LastIndex(host, ":"); idx >= 0 {
-		// Only strip if it looks like a port number after the colon
 		portStr := host[idx+1:]
 		if _, err := strconv.Atoi(portStr); err == nil {
 			host = host[:idx]
@@ -41,35 +44,21 @@ func ParseTestSubdomain(host string) (int, bool) {
 	}
 
 	// Remove ".test" suffix
-	subdomain := strings.TrimSuffix(host, ".test")
+	name := strings.TrimSuffix(host, ".test")
 
 	// Must have exactly one label (no dots)
-	if subdomain == "" || strings.Contains(subdomain, ".") {
+	if name == "" || strings.Contains(name, ".") {
 		return 0, false
 	}
 
-	// "tmp" is reserved for the upload handler
-	if subdomain == "tmp" {
+	// "tmp" and "test" are reserved
+	if name == "tmp" || name == "test" {
 		return 0, false
 	}
 
-	// Parse as integer
-	port, err := strconv.Atoi(subdomain)
-	if err != nil {
-		return 0, false
-	}
-
-	// Validate range
-	if port < 1 || port > 65535 {
-		return 0, false
-	}
-
-	// Block ports that would create loops
-	if blockedProxyPorts[port] {
-		return 0, false
-	}
-
-	return port, true
+	// Look up in the proxy DB
+	port, ok := db.Get(name)
+	return port, ok
 }
 
 // NewReverseProxy creates an httputil.ReverseProxy that forwards requests to

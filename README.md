@@ -2,7 +2,7 @@
 
 A single Go binary that provides local development utilities for AI agent workflows:
 
-- **Reverse proxy** — access any `localhost:<port>` via `https://<port>.test`
+- **Reverse proxy** — access any `localhost:<port>` via named `https://<name>.test` URLs, managed via CLI
 - **File upload** — drag-drop/paste file upload with `@`-prefixed path for AI agents
 - **Built-in DNS** — automatically resolves `*.test` domains to your machine's IP (zero-config)
 - **Auto-cleanup** — uploaded files clean up after 1 hour
@@ -25,17 +25,28 @@ sudo systemctl enable --now ai-remote-utils
 
 ### 🌐 Reverse proxy for `*.test` domains
 
-Access any local dev server via `https://<port>.test` — no more `localhost:3000`:
+Access any local dev server via a named `https://<name>.test` URL — no more `localhost:3000`:
 
-```
-https://3000.test/      →  http://localhost:3000/
-https://8080.test/      →  http://localhost:8080/
+```bash
+# Add a proxy entry
+ai-remote-utils proxy add --name=myapp --port=3000
+
+# Now access it
+https://myapp.test/  →  http://localhost:3000/
+
+# List all proxies
+ai-remote-utils proxy list
+
+# Remove a proxy
+ai-remote-utils proxy del --name=myapp
 ```
 
+- Proxy entries are persisted in `~/.ai-remote-utils/proxies.json` (survives restarts)
+- Edits to `proxies.json` are picked up at runtime (hot-reload via mtime check)
 - WebSocket support works automatically (Vite, Next.js hot-reload)
 - Host header is preserved as `*.test` (upstream sees the original hostname)
 - Blocked ports: 53 (DNS), 80 (HTTP), 443 (HTTPS) — prevents loops
-- Invalid ports → 400 Bad Request; unreachable → 502 Bad Gateway
+- Unknown proxy names → 404 Not Found
 
 ### 📁 File upload at `tmp.test`
 
@@ -80,9 +91,24 @@ echo "127.0.0.1 tmp.test 3000.test 8080.test" | sudo tee -a /etc/hosts
 |------|---------|---------|-------------|
 | `-port` | `443` | `PORT` | HTTPS server port |
 | `-max-size` | `52428800` (50 MB) | `MAX_UPLOAD_SIZE` | Maximum upload file size in bytes |
-| `-cert-dir` | `~/.ai-remote-utils/` | `CERT_DIR` | Directory for TLS certificates |
+| `-cert-dir` | `~/.ai-remote-utils/` | `CERT_DIR` | Directory for TLS certificates and proxy DB |
 | `-upload-dir` | `/tmp/u` | `UPLOAD_DIR` | Upload directory |
 | `--install-service` | `false` | — | Install systemd service and exit (no other flags needed) |
+
+### Proxy management subcommands
+
+Manage reverse proxy entries without restarting the server:
+
+```bash
+# Add a named proxy (persisted to ~/.ai-remote-utils/proxies.json)
+ai-remote-utils proxy add --name=myapp --port=3000
+
+# Delete a proxy
+ai-remote-utils proxy del --name=myapp
+
+# List all proxies
+ai-remote-utils proxy list
+```
 
 Flags override environment variables. Environment variables override defaults.
 
@@ -122,8 +148,9 @@ Response (multiple files):
 
 ```
 main.go         — entry point, three listeners (DNS :53, HTTP redirect :80, HTTPS :443)
-server.go       — virtual host routing (tmp.test → upload, <port>.test → proxy)
-proxy.go        — reverse proxy handler with WebSocket support
+server.go       — virtual host routing (tmp.test → upload, <name>.test → proxy via ProxyDB)
+proxy.go        — reverse proxy handler with WebSocket support, LookupProxy
+proxydb.go      — persistent proxy database (JSON-backed, thread-safe, hot-reload)
 dns.go          — built-in DNS server for *.test domains
 redirect.go     — HTTP → HTTPS redirect server
 upload.go       — file upload handler, name generation
@@ -146,7 +173,7 @@ static/         — frontend HTML/CSS/JS assets
 | Host | Routes to |
 |------|-----------|
 | `tmp.test` | File upload UI + upload API (with security headers) |
-| `<port>.test` | Reverse proxy to `http://localhost:<port>` (no security headers) |
+| `<name>.test` | Reverse proxy to `http://localhost:<port>` via ProxyDB lookup (no security headers) |
 | anything else | 404 Not Found |
 
 ### Packages

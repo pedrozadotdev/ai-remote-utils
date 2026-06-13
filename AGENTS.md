@@ -11,7 +11,9 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 | Change cleanup behavior | `cleanup.go` — `cleanupOnce` + `StartCleanup` ; `cleanup_test.go` |
 | Change TLS/cert behavior | `cert.go` — cert generation, SAN detection, expiry, persistence; `cert_test.go` |
 | Change DNS behavior | `dns.go` — `StartDNS`, wire protocol, interface matching; `dns_test.go` |
-| Change reverse proxy | `proxy.go` — `ParseTestSubdomain`, `NewReverseProxy`; `proxy_test.go` |
+| Change reverse proxy | `proxy.go` — `LookupProxy`, `NewReverseProxy`; `proxy_test.go` |
+| Change proxy persistence | `proxydb.go` — ProxyDB (Load/Save/Add/Delete/Get/List/Refresh); `proxydb_test.go` |
+| Change proxy management CLI | `main.go` — `handleProxySubcommand`, `handleProxyAdd`, `handleProxyDel`, `handleProxyList` |
 | Change HTTP redirect | `redirect.go` — `StartRedirect`; `redirect_test.go` |
 | Add/change routes or middleware | `server.go` — `NewServer` virtual host mux; `server_test.go` |
 | Change main.go wiring | `main.go` — flag parsing, listener orchestration, signal handling |
@@ -57,13 +59,14 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 - Mutex-protected name generation with collision retry (max 10)
 
 ### Reverse proxy conventions
-- `ParseTestSubdomain` extracts port from `<port>.test` hostnames
+- `LookupProxy` extracts subdomain from `<name>.test` hostnames, looks up name in ProxyDB
 - Case-insensitive matching
 - Strips `:443` port suffix before matching
 - Blocked ports: 53, 80, 443 (prevents loops)
 - Host header preserved as `*.test` (not rewritten to localhost)
 - `URL.Scheme` → `http`, `URL.Host` → `localhost:<port>` for TCP routing
 - Default transport enables WebSocket upgrades
+- Unknown names return 404 (not a proxy entry), not 502 (upstream unreachable)
 
 ### Review triggers
 When these code patterns appear in a diff, flag for review:
@@ -73,6 +76,8 @@ When these code patterns appear in a diff, flag for review:
 - Nested guard conditions where outer condition implies inner
 - Proxy Director modifying `r.Host` (should preserve original)
 - DNS responses for non-`.test` domains that return data (ensure REFUSED is not accidentally changed to success or NXDOMAIN)
+- `blockedProxyPorts` bypass via JSON file edit (LoadProxyDB and Refresh must validate ports)
+- ProxyDB name validation bypass — `LookupProxy` must block reserved names (`tmp`, `test`) alongside `validateName`
 
 ## Pipeline Workflow
 
@@ -86,6 +91,9 @@ When developing this project, sequence through:
 7. `06-docsync` — sync README.md and AGENTS.md with current state
 
 ## Relevant Solution Artifacts
+
+Project-specific solutions at `docs/solutions/`:
+- `go-json-persistent-store-proxydb-pattern.md` — Go JSON-backed persistent store with write-through, mtime hot-reload, thread safety
 
 Global solutions at `~/.pi/agent/docs/solutions/`:
 - `architecture/go-tls-key-permissions.md` — private key 0600 rule

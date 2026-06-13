@@ -2,5 +2,7 @@
 /docs/plans/
 /docs/reviews/
 /docs/brainstorms/
+/docs/adr/
+/tmp/
 ai-remote-utils
 coverage.out

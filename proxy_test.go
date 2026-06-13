@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -11,101 +10,113 @@ import (
 	"testing"
 )
 
-func TestParseTestSubdomain_Valid(t *testing.T) {
-	tests := []struct {
-		host     string
-		wantPort int
-		wantOK   bool
-	}{
-		{"3000.test", 3000, true},
-		{"8080.test", 8080, true},
-		{"1.test", 1, true},
-		{"65535.test", 65535, true},
-		{"3000.TEST", 3000, true},
-		{"3000.Test", 3000, true},
+// ---- LookupProxy ----
+
+func TestLookupProxy_Found(t *testing.T) {
+	db := testProxyDB(t, map[string]int{"myapp": 3000, "api": 8080})
+
+	port, ok := LookupProxy("myapp.test", db)
+	if !ok || port != 3000 {
+		t.Errorf("LookupProxy('myapp.test') = (%d, %v), want (3000, true)", port, ok)
 	}
-	for _, tc := range tests {
-		port, ok := ParseTestSubdomain(tc.host)
-		if ok != tc.wantOK || port != tc.wantPort {
-			t.Errorf("ParseTestSubdomain(%q) = (%d, %v), want (%d, %v)",
-				tc.host, port, ok, tc.wantPort, tc.wantOK)
-		}
+
+	port, ok = LookupProxy("api.test", db)
+	if !ok || port != 8080 {
+		t.Errorf("LookupProxy('api.test') = (%d, %v), want (8080, true)", port, ok)
 	}
 }
 
-func TestParseTestSubdomain_Reserved(t *testing.T) {
-	tests := []struct {
-		host   string
-		reason string
-	}{
-		{"tmp.test", "reserved for upload handler"},
-	}
-	for _, tc := range tests {
-		port, ok := ParseTestSubdomain(tc.host)
-		if ok || port != 0 {
-			t.Errorf("ParseTestSubdomain(%q) = (%d, %v), want (0, false) [%s]",
-				tc.host, port, ok, tc.reason)
-		}
+func TestLookupProxy_NotFound(t *testing.T) {
+	db := testProxyDB(t, map[string]int{"myapp": 3000})
+
+	port, ok := LookupProxy("unknown.test", db)
+	if ok || port != 0 {
+		t.Errorf("LookupProxy('unknown.test') = (%d, %v), want (0, false)", port, ok)
 	}
 }
 
-func TestParseTestSubdomain_Invalid(t *testing.T) {
+func TestLookupProxy_ReservedTmp(t *testing.T) {
+	db := testProxyDB(t, map[string]int{"myapp": 3000})
+
+	port, ok := LookupProxy("tmp.test", db)
+	if ok || port != 0 {
+		t.Errorf("LookupProxy('tmp.test') = (%d, %v), want (0, false)", port, ok)
+	}
+}
+
+func TestLookupProxy_StripsPortSuffix(t *testing.T) {
+	db := testProxyDB(t, map[string]int{"myapp": 3000})
+
+	port, ok := LookupProxy("myapp.test:443", db)
+	if !ok || port != 3000 {
+		t.Errorf("LookupProxy('myapp.test:443') = (%d, %v), want (3000, true)", port, ok)
+	}
+}
+
+func TestLookupProxy_NoSubdomain(t *testing.T) {
+	db := testProxyDB(t, map[string]int{"myapp": 3000})
+
 	tests := []struct {
-		host   string
-		reason string
+		host string
+		desc string
 	}{
-		{"abc.test", "non-numeric subdomain"},
 		{"test", "no subdomain (no dot)"},
 		{".test", "empty subdomain"},
 		{"", "empty string"},
-		{"abc.def.test", "too many labels"},
+		{"myapp", "no .test suffix"},
+		{"example.com", "non-.test domain"},
 	}
 	for _, tc := range tests {
-		port, ok := ParseTestSubdomain(tc.host)
+		port, ok := LookupProxy(tc.host, db)
 		if ok || port != 0 {
-			t.Errorf("ParseTestSubdomain(%q) = (%d, %v), want (0, false) [%s]",
-				tc.host, port, ok, tc.reason)
+			t.Errorf("LookupProxy(%q) = (%d, %v), want (0, false) [%s]",
+				tc.host, port, ok, tc.desc)
 		}
 	}
 }
 
-func TestParseTestSubdomain_BlockedPorts(t *testing.T) {
-	blocked := []int{53, 80, 443}
-	for _, p := range blocked {
-		host := fmt.Sprintf("%d.test", p)
-		port, ok := ParseTestSubdomain(host)
-		if ok || port != 0 {
-			t.Errorf("ParseTestSubdomain(%q) = (%d, %v), want (0, false) [blocked port]",
-				host, port, ok)
-		}
+func TestLookupProxy_MultipleLabels(t *testing.T) {
+	db := testProxyDB(t, map[string]int{"myapp": 3000})
+
+	// Multi-label subdomains (e.g., "foo.bar.test") are not supported
+	port, ok := LookupProxy("foo.bar.test", db)
+	if ok || port != 0 {
+		t.Errorf("LookupProxy('foo.bar.test') = (%d, %v), want (0, false)", port, ok)
 	}
 }
 
-func TestParseTestSubdomain_OutOfRange(t *testing.T) {
-	tests := []struct {
-		host   string
-		reason string
-	}{
-		{"0.test", "zero"},
-		{"-1.test", "negative"},
-		{"99999.test", "overflow"},
-		{"70000.test", "overflow"},
-	}
-	for _, tc := range tests {
-		port, ok := ParseTestSubdomain(tc.host)
-		if ok || port != 0 {
-			t.Errorf("ParseTestSubdomain(%q) = (%d, %v), want (0, false) [%s]",
-				tc.host, port, ok, tc.reason)
-		}
-	}
-}
+func TestLookupProxy_CaseInsensitive(t *testing.T) {
+	db := testProxyDB(t, map[string]int{"myapp": 3000})
 
-func TestParseTestSubdomain_StripsPortSuffix(t *testing.T) {
-	port, ok := ParseTestSubdomain("3000.test:443")
+	// Lookup is case-insensitive on the hostname
+	port, ok := LookupProxy("MyApp.test", db)
 	if !ok || port != 3000 {
-		t.Errorf("ParseTestSubdomain(%q) = (%d, %v), want (3000, true)", "3000.test:443", port, ok)
+		t.Errorf("LookupProxy('MyApp.test') = (%d, %v), want (3000, true)", port, ok)
+	}
+
+	port, ok = LookupProxy("MYAPP.TEST", db)
+	if !ok || port != 3000 {
+		t.Errorf("LookupProxy('MYAPP.TEST') = (%d, %v), want (3000, true)", port, ok)
 	}
 }
+
+func TestLookupProxy_NilDB(t *testing.T) {
+	port, ok := LookupProxy("myapp.test", nil)
+	if ok || port != 0 {
+		t.Errorf("LookupProxy with nil db = (%d, %v), want (0, false)", port, ok)
+	}
+}
+
+func TestLookupProxy_EmptyDB(t *testing.T) {
+	db := testProxyDB(t, nil)
+
+	port, ok := LookupProxy("anything.test", db)
+	if ok || port != 0 {
+		t.Errorf("LookupProxy with empty db = (%d, %v), want (0, false)", port, ok)
+	}
+}
+
+// ---- Reverse proxy (unchanged) ----
 
 func TestReverseProxy_ProxiesHTTP(t *testing.T) {
 	// Upstream echo server that records the Host header it receives

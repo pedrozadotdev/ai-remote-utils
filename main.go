@@ -25,6 +25,44 @@ const (
 )
 
 func main() {
+	// Custom usage that shows server flags AND subcommands
+	flag.Usage = func() {
+		w := flag.CommandLine.Output()
+		fmt.Fprintf(w, `Usage:
+  aru [flags]                      Start the HTTPS development server
+  aru proxy <command> [options]    Manage reverse proxy entries
+  aru worktree <command> [args]    Manage git worktrees for branch isolation
+  aru help                         Show this help text
+
+Server Flags:
+`)
+		flag.PrintDefaults()
+		fmt.Fprintf(w, `
+Proxy Commands:
+  add --name=X --port=Y    Add a reverse proxy entry for <name>.test -> localhost:Y
+  del --name=X             Remove a proxy entry
+  list                     List all proxy entries
+
+Worktree Commands:
+  add <branch>     Create a git worktree for <branch>, set up tmux, and attach
+  del <branch>     Remove the git worktree and clean up associated resources
+  d    <branch>    Alias for del
+  open <branch>    Re-attach to an existing worktree's tmux session
+  o    <branch>    Alias for open
+  list             List git worktrees (marking the current one)
+  l                Alias for list
+
+Examples:
+  aru                           Start the server
+  aru -port 8443                Start on port 8443
+  aru proxy add --name=myapp --port=3000
+  aru proxy list
+  aru worktree add feature-x
+  aru worktree open feature-x
+  aru --install-service         Install and enable systemd service
+`)
+	}
+
 	// Check for subcommands before parsing server flags
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -34,14 +72,17 @@ func main() {
 		case "worktree":
 			handleWorktreeSubcommand(os.Args[2:])
 			return
+		case "help":
+			flag.Usage()
+			os.Exit(0)
 		}
 	}
 
 	// --- Flag parsing ---
-	port := flag.Int("port", lookupEnvInt("PORT", defaultPort), "HTTPS server port")
-	maxSize := flag.Int("max-size", lookupEnvInt("MAX_UPLOAD_SIZE", defaultMaxSize), "Maximum upload file size in bytes")
-	certDir := flag.String("cert-dir", lookupEnvStr("CERT_DIR", defaultCertDir()), "Directory for TLS certificates")
-	uploadDir := flag.String("upload-dir", lookupEnvStr("UPLOAD_DIR", defaultUploadDir()), "Upload directory")
+	port := flag.Int("port", lookupEnvInt("PORT", defaultPort), "HTTPS server port (env PORT)")
+	maxSize := flag.Int("max-size", lookupEnvInt("MAX_UPLOAD_SIZE", defaultMaxSize), "Maximum upload file size in bytes (env MAX_UPLOAD_SIZE)")
+	certDir := flag.String("cert-dir", lookupEnvStr("CERT_DIR", defaultCertDir()), "Directory for TLS certificates (env CERT_DIR)")
+	uploadDir := flag.String("upload-dir", lookupEnvStr("UPLOAD_DIR", defaultUploadDir()), "Upload directory (env UPLOAD_DIR)")
 	installSvc := flag.Bool("install-service", false, "Install systemd service and exit")
 	flag.Parse()
 

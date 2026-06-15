@@ -14,8 +14,8 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 | Change reverse proxy | `proxy.go` — `LookupProxy`, `NewReverseProxy`; `proxy_test.go` |
 | Change proxy persistence | `proxydb.go` — ProxyDB (Load/Save/Add/Delete/Get/List/Refresh); `proxydb_test.go` |
 | Change proxy management CLI | `main.go` — `handleProxySubcommand`, `handleProxyAdd`, `handleProxyDel`, `handleProxyList` |
-| Change aru.json config parsing | `aruconfig.go` — `ParseAruConfig`, `collectPortPlaceholders`, `resolvePlaceholders`, `cloneConfig`, `flattenConfig`; `aruconfig_test.go` |
-| Change worktree behavior | `worktree.go` — `handleWorktreeAdd`, `handleWorktreeDel`, `handleWorktreeOpen`, `handleWorktreeList`, `readConfig`, `runSetupIfNeeded`, `setupProxy`/`removeProxy`; `worktree_test.go` |
+| Change aru.json config parsing | `aruconfig.go` — `ParseAruConfig`, `collectPortPlaceholders`, `resolvePlaceholders`, `cloneConfig`; `aruconfig_test.go`. Types: `AruConfig` (tmux as `[]TmuxWindowEntry`, proxy as `[]ProxyConfig`), `TmuxWindowEntry` (name+command+env), `ProxyConfig`. No `ResolvedConfig` or `flattenConfig` — `AruConfig` used directly. |
+| Change worktree behavior | `worktree.go` — `handleWorktreeAdd`, `handleWorktreeDel`, `handleWorktreeOpen`, `handleWorktreeList`, `readConfig`, `runSetupIfNeeded`, `setupProxy`/`removeProxy`; `worktree_test.go`. Tmux config type is `[]TmuxWindowEntry` (ordered slice), not `TmuxConfig` (map). Proxy config is `[]ProxyConfig` (supports multi-proxy). `ResolvedConfig` removed — use `AruConfig.Worktree.*` directly. |
 | Add worktree subcommand | `main.go` — add `"worktree"` case to subcommand switch alongside `"proxy"` |
 | Change HTTP redirect | `redirect.go` — `StartRedirect`; `redirect_test.go` |
 | Add/change routes or middleware | `server.go` — `NewServer` virtual host mux; `server_test.go` |
@@ -78,7 +78,11 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 - `setupTmuxSession` returns errors instead of calling `os.Exit` — callers handle fallback
 - Port discovery scans 1024-9999 via `net.Listen` (TOCTOU accepted — port only used for env var)
 - Missing tmux = hard error; missing git = hard error
-- `tryCreatePiWindow` now returns `bool` (caller decides whether to select the pi window); in config-driven sessions, pi is NOT selected (user's last config window is preserved)
+- Tmux config is `[]TmuxWindowEntry` (ordered slice), not `TmuxConfig` map. Window names are stored in the `Name` field, not map keys. The first entry creates `new-session`, subsequent entries create `new-window`.
+- Config file required: `setupTmuxSession` returns an error if no `aru.json` with a `tmux` section is found. There is no fallback minimal session.
+- Stale socket file (`~/.aru/sockets/<project>-<branch>.sock`) is only removed when creating a new session, not unconditionally at the start of `setupTmuxSession`. This avoids wiping the socket for an existing session.
+- New sessions select window 0 after creation (`select-window -t <session>:0`) for consistent UX.
+- SIGINT trap (`trap ':' INT`) is prepended to tmux command strings so the outer shell survives Ctrl+C and drops into a fallback bash shell. Child processes remain interruptible (default SIG_DFL).
 
 ### Reverse proxy conventions
 - `LookupProxy` extracts subdomain from `<name>.test` hostnames, looks up name in ProxyDB
@@ -103,10 +107,16 @@ When these code patterns appear in a diff, flag for review:
 - `os.Exit()` inside functions called from goroutines (cannot be recovered)
 - `waitForSocket` using `os.Stat` instead of actual readiness check (`tmux has-session`)
 - aru.json commands silently shell-escaped — only `env` values are escaped; `command` is run verbatim per the trust model
-- New string fields added to `WorktreeConfig` or `TmuxWindow` without updating the struct walker (`applyPlaceholders`, `collectPortNumbers`, `cloneConfig`) — all three must stay in sync
-- `cloneConfig` modified without adding the new field to the copy — a missing field means `SetupOneshot` (or any future field) gets silently dropped during resolution
+- New string fields added to `WorktreeConfig` or `TmuxWindowEntry` without updating the struct walker (`applyPlaceholders`, `collectPortNumbers`, `cloneConfig`) — all three must stay in sync
+- `cloneConfig` modified without adding the new field to the copy — a missing field gets silently dropped during resolution
 - Port state persistence skipped (`removeAllocatedPorts` not called in `handleWorktreeDel`) — would leak state files
 - Setup-complete marker not removed on worktree deletion (`clearSetupComplete` not called alongside `removeAllocatedPorts`)
+- **`ResolvedConfig` and `flattenConfig` removed** — any code referencing `resolved.Proxy` (pointer) must be updated to iterate `resolved.Proxy` (slice). Same for `resolved.Setup`/`resolved.Teardown` → `resolved.Worktree.Setup`/`resolved.Worktree.Teardown`.
+- **Single-proxy guard removed** — `if resolved.Proxy != nil { ... resolved.Proxy.Name ... }` must become `for _, p := range resolved.Proxy { if p.Name != "" { ... } }`. Missing iteration means only one proxy is processed.
+- **Tmux map → slice migration** — `cfg.Tmux[name]` map lookup must become iteration over `cfg.Tmux` checking `entry.Name`. Missing the `Name` field in `cloneConfig` means window names are silently dropped.
+- **SIGINT trap missing** — every `buildTmuxCommand` path should include `trap ':' INT` before the env exports and command. Missing trap means Ctrl+C kills the tmux window.
+- **Stale socket removal** — `os.Remove(sock)` moved inside the `has-session` check. If the removal stays unconditional, it may wipe the socket for an existing session.
+- **Select-window after new session** — `select-window -t <session>:0` should run after `createMinimalSession`/`createConfigSession`. Missing this means window index may be arbitrary.
 
 ## Pipeline Workflow
 
@@ -125,6 +135,7 @@ Project-specific solutions at `docs/solutions/`:
 - `go-json-persistent-store-proxydb-pattern.md` — Go JSON-backed persistent store with write-through, mtime hot-reload, thread safety
 - `go-mock-external-commands-testing.md` — Mocking external commands in Go tests using PATH manipulation
 - `go-struct-walking-placeholder-resolution.md` — Go struct-walking placeholder resolution (replaces marshal-replace-unmarshal to avoid JSON injection)
+- `go-port-state-persistence-lifecycle.md` — Go resource-scoped state persistence with lifecycle management (allocate, persist, load, remove, fallback) for per-resource JSON state files
 
 Global solutions at `~/.pi/agent/docs/solutions/`:
 - `architecture/go-tls-key-permissions.md` — private key 0600 rule

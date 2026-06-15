@@ -154,7 +154,6 @@ func TestProxyDB_Add_InvalidName(t *testing.T) {
 		{"", 3000, "1-63"},
 		{strings.Repeat("a", 64), 3000, "1-63"},
 		{"my app", 3000, "char"},
-		{"my.app", 3000, "char"},
 		{"my\tapp", 3000, "char"},
 	}
 

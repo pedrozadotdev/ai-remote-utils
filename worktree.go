@@ -407,19 +407,19 @@ func runTeardownCommands(target string, commands []string) {
 // continues. The marker is written after the loop runs (we don't track per-
 // command success — the trust model is "if user ran the setup, it succeeded
 // from their perspective"). To force re-run, delete the marker file.
-func runSetupIfNeeded(project, branch, target string, resolved *ResolvedConfig) {
-	if resolved == nil || len(resolved.Setup) == 0 {
+func runSetupIfNeeded(project, branch, target string, resolved *AruConfig) {
+	if resolved == nil || resolved.Worktree == nil || len(resolved.Worktree.Setup) == 0 {
 		return
 	}
 
-	if resolved.SetupOneshot && isSetupComplete(project, branch) {
+	if resolved.Worktree.SetupOneshot && isSetupComplete(project, branch) {
 		slog.Info("setup already complete, skipping (setup_oneshot=true)", "project", project, "branch", branch)
 		return
 	}
 
-	runSetupCommands(target, resolved.Setup)
+	runSetupCommands(target, resolved.Worktree.Setup)
 
-	if resolved.SetupOneshot {
+	if resolved.Worktree.SetupOneshot {
 		if err := markSetupComplete(project, branch); err != nil {
 			slog.Warn("failed to mark setup complete, future opens may re-run", "error", err)
 		}
@@ -427,7 +427,7 @@ func runSetupIfNeeded(project, branch, target string, resolved *ResolvedConfig) 
 }
 
 // buildTmuxCommand constructs a tmux command string from a TmuxWindow config.
-// Format: export K1=V1; export K2=V2; command; exec bash
+// Format: trap ':' INT; export K1=V1; export K2=V2; command; exec bash
 //
 // SECURITY: Env values are shell-escaped with strconv.Quote to prevent
 // injection via crafted env values (e.g., a value containing `; rm -rf /`).
@@ -438,6 +438,12 @@ func runSetupIfNeeded(project, branch, target string, resolved *ResolvedConfig) 
 // care as shell scripts.
 func buildTmuxCommand(win TmuxWindow) string {
 	var parts []string
+
+	// Install a no-op SIGINT handler so the shell survives Ctrl+C on the
+	// command and continues to exec bash (fallback shell). Child processes
+	// get the default disposition (SIG_DFL), so the command is still
+	// interruptible — only the outer shell has the handler.
+	parts = append(parts, "trap ':' INT")
 
 	// Sort env keys for deterministic output
 	if len(win.Env) > 0 {
@@ -597,7 +603,7 @@ const (
 //
 // If project or branch is empty, warns and returns nil.
 // If aru.json is missing or malformed, warns and returns nil.
-func readConfig(target, project, branch string, source portSource) *ResolvedConfig {
+func readConfig(target, project, branch string, source portSource) *AruConfig {
 	if project == "" || branch == "" {
 		slog.Warn("project or branch is empty, skipping config resolution")
 		return nil
@@ -681,14 +687,14 @@ func resolvePortsForSource(project, branch string, source portSource, placeholde
 
 // readAndResolveConfig is the allocating variant of readConfig, used by `add`.
 // Kept as a separate function for backward compatibility and clear call sites.
-func readAndResolveConfig(target, project, branch string) *ResolvedConfig {
+func readAndResolveConfig(target, project, branch string) *AruConfig {
 	return readConfig(target, project, branch, portSourceAllocate)
 }
 
 // readAndResolveConfigOpen is the load-from-state variant of readConfig, used by `open`.
 // It re-uses ports that were allocated by the original `aru worktree add` call,
 // ensuring the proxy and tmux env vars stay consistent across reboots.
-func readAndResolveConfigOpen(target, project, branch string) *ResolvedConfig {
+func readAndResolveConfigOpen(target, project, branch string) *AruConfig {
 	return readConfig(target, project, branch, portSourceLoad)
 }
 
@@ -696,7 +702,7 @@ func readAndResolveConfigOpen(target, project, branch string) *ResolvedConfig {
 // (only <PROJECT> and <BRANCH>, no port allocation).
 // If project or branch is empty, warns and returns nil.
 // If aru.json is missing or malformed, warns and returns nil.
-func readTeardownConfig(target, project, branch string) *ResolvedConfig {
+func readTeardownConfig(target, project, branch string) *AruConfig {
 	if project == "" || branch == "" {
 		slog.Warn("project or branch is empty, skipping teardown config")
 		return nil
@@ -767,10 +773,10 @@ func removeProxy(dbPath, name string) {
 // ── Tmux session management ─────────────────────────────────────────────
 
 // setupTmuxSession creates or attaches to a tmux session for a worktree.
-// If tmuxConfig is nil or empty, a minimal session (single misc window) is created.
-// If tmuxConfig has entries, the first key is used for new-session and the rest
-// create new-window commands. Blocks until the user detaches.
-func setupTmuxSession(project, branch, worktreeDir string, tmuxConfig TmuxConfig) error {
+// tmuxConfig must have at least one entry (defined via aru.json's tmux section).
+// The first entry creates the session, subsequent entries create new-windows.
+// Blocks until the user detaches.
+func setupTmuxSession(project, branch, worktreeDir string, tmuxConfig []TmuxWindowEntry) error {
 	requireCmd("tmux")
 
 	sessionName := sanitizeSessionName(branch)
@@ -782,22 +788,23 @@ func setupTmuxSession(project, branch, worktreeDir string, tmuxConfig TmuxConfig
 		return fmt.Errorf("worktree: failed to create tmux sockets directory %s: %w", socketDir, err)
 	}
 
-	// Clean up stale socket file
-	os.Remove(sock)
-
 	// Check if session already exists
 	checkCmd := exec.Command("tmux", "-S", sock, "has-session", "-t", sessionName)
 	if checkCmd.Run() != nil {
-		// Session does not exist — create it
+		// Session does not exist — remove stale socket file if present
+		os.Remove(sock)
+
 		slog.Info("creating tmux session", "session", sessionName, "dir", worktreeDir)
 
 		if len(tmuxConfig) == 0 {
-			// Minimal session (backward compat when no config)
-			createMinimalSession(sock, sessionName, worktreeDir)
-		} else {
-			// Config-driven session
-			createConfigSession(sock, sessionName, worktreeDir, tmuxConfig)
+			return fmt.Errorf("worktree: aru.json not found in worktree root — create an aru.json with a tmux section to define worktree windows")
 		}
+
+		// Config-driven session
+		createConfigSession(sock, sessionName, worktreeDir, tmuxConfig)
+
+		// Select the first window (index 0) for new sessions
+		exec.Command("tmux", "-S", sock, "select-window", "-t", sessionName+":0").Run()
 	}
 
 	// Wait for session to be ready
@@ -816,69 +823,34 @@ func setupTmuxSession(project, branch, worktreeDir string, tmuxConfig TmuxConfig
 	return nil
 }
 
-// createMinimalSession creates a basic tmux session with a single misc window.
-// In the minimal case (no user config), we want to land on the pi window
-// (when available) so the user can immediately start working with pi.
-func createMinimalSession(sock, sessionName, worktreeDir string) {
-	args := buildSessionArgs(sock, sessionName, worktreeDir, "misc", "bash; exec bash")
-	cmd := exec.Command("tmux", args...)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		slog.Warn("failed to create minimal tmux session", "error", err)
-	}
-
-	// Create pi window if pi command is available, then select it.
-	// Selecting pi is only appropriate here (no user-defined windows to
-	// override). createConfigSession does NOT select pi — it leaves the
-	// user on their last config-defined window.
-	if tryCreatePiWindow(sock, worktreeDir) {
-		exec.Command("tmux", "-S", sock, "select-window", "-t", "pi").Run()
-	}
-}
-
 // createConfigSession creates a tmux session with windows defined by the config.
-// The first window in the map is created via new-session, the rest via new-window.
-func createConfigSession(sock, sessionName, worktreeDir string, tmuxConfig TmuxConfig) {
-	// Sort keys for deterministic window creation order
-	keys := make([]string, 0, len(tmuxConfig))
-	for k := range tmuxConfig {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	for i, name := range keys {
-		win := tmuxConfig[name]
+// The first entry in the slice is created via new-session, the rest via new-window.
+func createConfigSession(sock, sessionName, worktreeDir string, tmuxConfig []TmuxWindowEntry) {
+	for i, entry := range tmuxConfig {
+		win := TmuxWindow{Command: entry.Command, Env: entry.Env}
 		cmdStr := buildTmuxCommand(win)
 
 		if i == 0 {
 			// First window: new-session
-			args := buildSessionArgs(sock, sessionName, worktreeDir, name, cmdStr)
+			args := buildSessionArgs(sock, sessionName, worktreeDir, entry.Name, cmdStr)
 			cmd := exec.Command("tmux", args...)
 			cmd.Stderr = os.Stderr
 			if err := cmd.Run(); err != nil {
-				slog.Warn("failed to create tmux session window", "window", name, "error", err)
+				slog.Warn("failed to create tmux session window", "window", entry.Name, "error", err)
 			}
 		} else {
 			// Subsequent windows: new-window
 			args := []string{
 				"-S", sock,
-				"new-window", "-n", name, "-c", worktreeDir,
+				"new-window", "-n", entry.Name, "-c", worktreeDir,
 				cmdStr,
 			}
 			cmd := exec.Command("tmux", args...)
 			cmd.Stderr = os.Stderr
 			if err := cmd.Run(); err != nil {
-				slog.Warn("failed to create tmux window", "window", name, "error", err)
+				slog.Warn("failed to create tmux window", "window", entry.Name, "error", err)
 			}
 		}
-	}
-
-	// Auto-create pi window if available and not already present.
-	// Do NOT select it — the user has explicitly defined their windows,
-	// and we don't want to override their intent. The active window
-	// remains the last one we created (their last config-defined window).
-	if _, ok := tmuxConfig["pi"]; !ok {
-		tryCreatePiWindow(sock, worktreeDir)
 	}
 }
 
@@ -897,32 +869,6 @@ func buildSessionArgs(sock, sessionName, worktreeDir, windowName, cmdStr string)
 		";", "set-option", "-qs", "extended-keys", "off",
 		";", "set-option", "-qg", "extended-keys", "off",
 	}
-}
-
-// tryCreatePiWindow creates a pi window if the pi command is available.
-// Returns true if the pi window was created (caller may want to select it
-// in the minimal-session case). Selection is the caller's responsibility
-// — in the config-driven case we leave the active window on the user's
-// last config-defined window.
-//
-// The fallback command `pi || echo ...; exec bash` ensures the window
-// remains usable even if pi is in PATH but fails at runtime (e.g., the
-// binary is broken, or pi exits with an error).
-func tryCreatePiWindow(sock, worktreeDir string) bool {
-	if _, err := exec.LookPath("pi"); err != nil {
-		return false
-	}
-
-	piArgs := []string{
-		"-S", sock,
-		"new-window", "-n", "pi", "-c", worktreeDir,
-		"pi || echo 'pi command not found, falling back to bash'; exec bash",
-	}
-	if err := exec.Command("tmux", piArgs...).Run(); err != nil {
-		slog.Debug("failed to create pi window", "error", err)
-		return false
-	}
-	return true
 }
 
 // waitForSocket polls until tmux reports the session is ready.
@@ -1000,18 +946,23 @@ func handleWorktreeAdd(branch string) {
 	// Run setup commands if config provides them (respects setup_oneshot)
 	runSetupIfNeeded(projectName, branch, target, resolved)
 
-	// Register proxy if configured
-	if resolved != nil && resolved.Proxy != nil && resolved.Proxy.Port != "" {
-		port, err := strconv.Atoi(resolved.Proxy.Port)
-		if err != nil {
-			slog.Warn("invalid proxy port, skipping proxy registration", "port", resolved.Proxy.Port, "error", err)
-		} else {
-			setupProxy(defaultProxyDBPath(), resolved.Proxy.Name, port)
+	// Register proxies if configured
+	if resolved != nil {
+		for _, p := range resolved.Proxy {
+			if p.Port == "" {
+				continue
+			}
+			port, err := strconv.Atoi(p.Port)
+			if err != nil {
+				slog.Warn("invalid proxy port, skipping proxy registration", "port", p.Port, "error", err)
+				continue
+			}
+			setupProxy(defaultProxyDBPath(), p.Name, port)
 		}
 	}
 
 	// Determine tmux config (nil if no aru.json)
-	var tmuxConfig TmuxConfig
+	var tmuxConfig []TmuxWindowEntry
 	if resolved != nil {
 		tmuxConfig = resolved.Tmux
 	}
@@ -1054,13 +1005,18 @@ func handleWorktreeDel(branch string) {
 	resolved := readTeardownConfig(target, projectName, branch)
 
 	// Run teardown commands if config provides them
-	if resolved != nil && len(resolved.Teardown) > 0 {
-		runTeardownCommands(target, resolved.Teardown)
+	if resolved != nil && resolved.Worktree != nil && len(resolved.Worktree.Teardown) > 0 {
+		runTeardownCommands(target, resolved.Worktree.Teardown)
 	}
 
-	// Remove proxy if configured
-	if resolved != nil && resolved.Proxy != nil && resolved.Proxy.Name != "" {
-		removeProxy(defaultProxyDBPath(), resolved.Proxy.Name)
+	// Remove proxies if configured
+	if resolved != nil {
+		for _, p := range resolved.Proxy {
+			if p.Name == "" {
+				continue
+			}
+			removeProxy(defaultProxyDBPath(), p.Name)
+		}
 	}
 
 	// Remove data symlink
@@ -1150,18 +1106,23 @@ func handleWorktreeOpen(branch string) {
 	// Run setup commands if config provides them (respects setup_oneshot)
 	runSetupIfNeeded(projectName, branch, target, resolved)
 
-	// Re-register proxy if configured
-	if resolved != nil && resolved.Proxy != nil && resolved.Proxy.Port != "" {
-		port, err := strconv.Atoi(resolved.Proxy.Port)
-		if err != nil {
-			slog.Warn("invalid proxy port, skipping proxy registration", "port", resolved.Proxy.Port, "error", err)
-		} else {
-			setupProxy(defaultProxyDBPath(), resolved.Proxy.Name, port)
+	// Re-register proxies if configured
+	if resolved != nil {
+		for _, p := range resolved.Proxy {
+			if p.Port == "" {
+				continue
+			}
+			port, err := strconv.Atoi(p.Port)
+			if err != nil {
+				slog.Warn("invalid proxy port, skipping proxy registration", "port", p.Port, "error", err)
+				continue
+			}
+			setupProxy(defaultProxyDBPath(), p.Name, port)
 		}
 	}
 
 	// Determine tmux config (nil if no aru.json)
-	var tmuxConfig TmuxConfig
+	var tmuxConfig []TmuxWindowEntry
 	if resolved != nil {
 		tmuxConfig = resolved.Tmux
 	}

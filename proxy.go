@@ -46,8 +46,8 @@ func LookupProxy(host string, db *ProxyDB) (int, bool) {
 	// Remove ".test" suffix
 	name := strings.TrimSuffix(host, ".test")
 
-	// Must have exactly one label (no dots)
-	if name == "" || strings.Contains(name, ".") {
+	// Must not be empty
+	if name == "" {
 		return 0, false
 	}
 

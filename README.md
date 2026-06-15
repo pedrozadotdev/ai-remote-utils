@@ -26,7 +26,7 @@ sudo systemctl enable --now aru
 
 ### 🌐 Reverse proxy for `*.test` domains
 
-Access any local dev server via a named `https://<name>.test` URL — no more `localhost:3000`:
+Access any local dev server via a named `https://<name>.test` URL — no more `localhost:3000`. Names can contain dots for multi-level subdomains (e.g., `https://api.myapp.test/` → `http://localhost:3001/`).
 
 ```bash
 # Add a proxy entry
@@ -48,6 +48,8 @@ aru proxy del --name=myapp
 - Host header is preserved as `*.test` (upstream sees the original hostname)
 - Blocked ports: 53 (DNS), 80 (HTTP), 443 (HTTPS) — prevents loops
 - Unknown proxy names → 404 Not Found
+- **Multi-proxy support**: `aru.json` can register multiple proxies for multiple services in one worktree (see [aru.json schema](#🔐-trust-model-for-arujson-commands))
+- **Dots in names**: Proxy names may contain dots for multi-level subdomains (e.g., `api.myapp.test`)
 
 ### 📁 File upload at `tmp.test`
 
@@ -129,14 +131,14 @@ Because you already have full shell access, the commands in `aru.json` provide n
     "setup_oneshot": true,
     "teardown": ["rm -rf .cache"]
   },
-  "tmux": {
-    "dev":  { "command": "npm run dev",   "env": { "PORT": "<PORT1>" } },
-    "misc": { "command": "bash" }
-  },
-  "proxy": {
-    "name": "<BRANCH>.<PROJECT>",
-    "port": "<PORT1>"
-  }
+  "tmux": [
+    { "name": "dev",  "command": "npm run dev",   "env": { "PORT": "<PORT1>" } },
+    { "name": "misc", "command": "bash" }
+  ],
+  "proxy": [
+    { "name": "<BRANCH>.<PROJECT>", "port": "<PORT1>" },
+    { "name": "api",                "port": "<PORT2>" }
+  ]
 }
 ```
 
@@ -144,9 +146,15 @@ Because you already have full shell access, the commands in `aru.json` provide n
 - `worktree.setup` — list of shell commands to run on `aru worktree add` and `aru worktree open`. Commands run verbatim via `bash -c` (see trust model below for security implications)
 - `worktree.setup_oneshot` — if `true`, setup runs only once per worktree session. A marker file at `~/.aru/state/<project>/<branch>/setup-complete` records that setup has run; subsequent opens skip setup. The marker is removed when the worktree is deleted. To force re-run, delete the marker file manually.
 - `worktree.teardown` — list of shell commands to run on `aru worktree del`
-- `tmux.<name>` — tmux window definition (first key = new-session, rest = new-window). `command` runs verbatim; `env` values are shell-escaped.
-- `proxy.name` — proxy name with `<PROJECT>`/`<BRANCH>` placeholders for dynamic naming
-- `proxy.port` — port with `<PORT1>`/`<PORT2>`/... placeholders (allocated from 1024-9999)
+- `tmux` — **ordered array** of tmux window definitions. The first entry is created via `new-session`, subsequent entries via `new-window`. Each entry has:
+  - `name` — window name (placeholders supported)
+  - `command` — shell command to run (runs verbatim via `bash -c`)
+  - `env` — optional map of environment variables (values are shell-escaped)
+- `proxy` — **array** of reverse proxy registrations (supports multiple proxies). Each entry has:
+  - `name` — proxy name with `<PROJECT>`/`<BRANCH>` placeholders for dynamic naming. Can contain dots for multi-level subdomains (e.g., `api.myapp.test`).
+  - `port` — port with `<PORT1>`/`<PORT2>`/... placeholders (allocated from 1024-9999)
+
+**SIGINT behavior:** Tmux commands get a `trap ':' INT` handler so the outer shell survives Ctrl+C and drops into a fallback bash shell. Child processes remain interruptible (default SIG_DFL disposition). This prevents accidentally closing the entire tmux window when pressing Ctrl+C on a dev server.
 
 Placeholders:
 - `<PROJECT>` — directory name of the main worktree

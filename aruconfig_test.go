@@ -15,14 +15,13 @@ func TestParseAruConfig_ValidJSON(t *testing.T) {
 			"setup": ["npm install", "npm run build"],
 			"teardown": ["rm -rf /tmp/data"]
 		},
-		"tmux": {
-			"misc": {"command": "bash"},
-			"dev": {"command": "npm run dev", "env": {"PORT": "<PORT1>"}}
-		},
-		"proxy": {
-			"name": "myapp.<BRANCH>.<PROJECT>",
-			"port": "<PORT1>"
-		}
+		"tmux": [
+			{"name": "misc", "command": "bash"},
+			{"name": "dev", "command": "npm run dev", "env": {"PORT": "<PORT1>"}}
+		],
+		"proxy": [
+			{"name": "myapp.<BRANCH>.<PROJECT>", "port": "<PORT1>"}
+		]
 	}`
 	if err := os.WriteFile(filepath.Join(dir, "aru.json"), []byte(jsonContent), 0644); err != nil {
 		t.Fatal(err)
@@ -47,37 +46,35 @@ func TestParseAruConfig_ValidJSON(t *testing.T) {
 		t.Errorf("Teardown = %v, want [rm -rf /tmp/data]", cfg.Worktree.Teardown)
 	}
 
-	// Tmux
+	// Tmux (slice order preserved)
 	if len(cfg.Tmux) != 2 {
 		t.Fatalf("Tmux has %d entries, want 2", len(cfg.Tmux))
 	}
-	misc, ok := cfg.Tmux["misc"]
-	if !ok {
-		t.Fatal("Tmux missing 'misc' key")
+	if cfg.Tmux[0].Name != "misc" {
+		t.Errorf("Tmux[0].Name = %q, want 'misc'", cfg.Tmux[0].Name)
 	}
-	if misc.Command != "bash" {
-		t.Errorf("misc.Command = %q, want 'bash'", misc.Command)
+	if cfg.Tmux[0].Command != "bash" {
+		t.Errorf("Tmux[0].Command = %q, want 'bash'", cfg.Tmux[0].Command)
 	}
-	dev, ok := cfg.Tmux["dev"]
-	if !ok {
-		t.Fatal("Tmux missing 'dev' key")
+	if cfg.Tmux[1].Name != "dev" {
+		t.Errorf("Tmux[1].Name = %q, want 'dev'", cfg.Tmux[1].Name)
 	}
-	if dev.Command != "npm run dev" {
-		t.Errorf("dev.Command = %q, want 'npm run dev'", dev.Command)
+	if cfg.Tmux[1].Command != "npm run dev" {
+		t.Errorf("Tmux[1].Command = %q, want 'npm run dev'", cfg.Tmux[1].Command)
 	}
-	if dev.Env["PORT"] != "<PORT1>" {
-		t.Errorf("dev.Env[PORT] = %q, want '<PORT1>'", dev.Env["PORT"])
+	if cfg.Tmux[1].Env["PORT"] != "<PORT1>" {
+		t.Errorf("Tmux[1].Env[PORT] = %q, want '<PORT1>'", cfg.Tmux[1].Env["PORT"])
 	}
 
 	// Proxy
-	if cfg.Proxy == nil {
-		t.Fatal("Proxy is nil")
+	if len(cfg.Proxy) != 1 {
+		t.Fatalf("Proxy has %d entries, want 1", len(cfg.Proxy))
 	}
-	if cfg.Proxy.Name != "myapp.<BRANCH>.<PROJECT>" {
-		t.Errorf("Proxy.Name = %q, want 'myapp.<BRANCH>.<PROJECT>'", cfg.Proxy.Name)
+	if cfg.Proxy[0].Name != "myapp.<BRANCH>.<PROJECT>" {
+		t.Errorf("Proxy[0].Name = %q, want 'myapp.<BRANCH>.<PROJECT>'", cfg.Proxy[0].Name)
 	}
-	if cfg.Proxy.Port != "<PORT1>" {
-		t.Errorf("Proxy.Port = %q, want '<PORT1>'", cfg.Proxy.Port)
+	if cfg.Proxy[0].Port != "<PORT1>" {
+		t.Errorf("Proxy[0].Port = %q, want '<PORT1>'", cfg.Proxy[0].Port)
 	}
 }
 
@@ -126,11 +123,11 @@ func TestParseAruConfig_EmptyConfig(t *testing.T) {
 	if cfg.Worktree != nil {
 		t.Error("Worktree should be nil for empty config")
 	}
-	if cfg.Tmux != nil {
-		t.Error("Tmux should be nil for empty config")
+	if len(cfg.Tmux) != 0 {
+		t.Error("Tmux should be nil/empty for empty config")
 	}
-	if cfg.Proxy != nil {
-		t.Error("Proxy should be nil for empty config")
+	if len(cfg.Proxy) != 0 {
+		t.Error("Proxy should be nil/empty for empty config")
 	}
 }
 
@@ -158,11 +155,74 @@ func TestParseAruConfig_PartialConfig(t *testing.T) {
 	if len(cfg.Worktree.Teardown) != 0 {
 		t.Errorf("Teardown = %v, want empty", cfg.Worktree.Teardown)
 	}
-	if cfg.Tmux != nil {
-		t.Error("Tmux should be nil")
+	if len(cfg.Tmux) != 0 {
+		t.Error("Tmux should be nil/empty")
 	}
-	if cfg.Proxy != nil {
-		t.Error("Proxy should be nil")
+	if len(cfg.Proxy) != 0 {
+		t.Error("Proxy should be nil/empty")
+	}
+}
+
+// ── New test: Tmux entry order preserved ──────────────────────────────────
+
+func TestParseAruConfig_TmuxEntryOrderPreserved(t *testing.T) {
+	dir := t.TempDir()
+	jsonContent := `{
+		"tmux": [
+			{"name": "editor", "command": "vim"},
+			{"name": "server", "command": "npm run dev"},
+			{"name": "logs", "command": "tail -f"}
+		]
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "aru.json"), []byte(jsonContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := ParseAruConfig(dir)
+	if err != nil {
+		t.Fatalf("ParseAruConfig() returned error: %v", err)
+	}
+
+	if len(cfg.Tmux) != 3 {
+		t.Fatalf("Tmux has %d entries, want 3", len(cfg.Tmux))
+	}
+	if cfg.Tmux[0].Name != "editor" {
+		t.Errorf("Tmux[0].Name = %q, want 'editor'", cfg.Tmux[0].Name)
+	}
+	if cfg.Tmux[1].Name != "server" {
+		t.Errorf("Tmux[1].Name = %q, want 'server'", cfg.Tmux[1].Name)
+	}
+	if cfg.Tmux[2].Name != "logs" {
+		t.Errorf("Tmux[2].Name = %q, want 'logs'", cfg.Tmux[2].Name)
+	}
+}
+
+// ── New test: Multiple proxies ────────────────────────────────────────────
+
+func TestParseAruConfig_MultipleProxies(t *testing.T) {
+	dir := t.TempDir()
+	jsonContent := `{
+		"proxy": [
+			{"name": "frontend", "port": "3000"},
+			{"name": "api", "port": "4000"}
+		]
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "aru.json"), []byte(jsonContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := ParseAruConfig(dir)
+	if err != nil {
+		t.Fatalf("ParseAruConfig() returned error: %v", err)
+	}
+	if len(cfg.Proxy) != 2 {
+		t.Fatalf("Proxy has %d entries, want 2", len(cfg.Proxy))
+	}
+	if cfg.Proxy[0].Name != "frontend" || cfg.Proxy[0].Port != "3000" {
+		t.Errorf("Proxy[0] = %+v, want {Name: frontend, Port: 3000}", cfg.Proxy[0])
+	}
+	if cfg.Proxy[1].Name != "api" || cfg.Proxy[1].Port != "4000" {
+		t.Errorf("Proxy[1] = %+v, want {Name: api, Port: 4000}", cfg.Proxy[1])
 	}
 }
 
@@ -189,8 +249,8 @@ func TestCollectPortPlaceholders_NilConfig(t *testing.T) {
 
 func TestCollectPortPlaceholders_Single(t *testing.T) {
 	cfg := &AruConfig{
-		Proxy: &ProxyConfig{
-			Port: "<PORT1>",
+		Proxy: []ProxyConfig{
+			{Port: "<PORT1>"},
 		},
 	}
 	nums := collectPortPlaceholders(cfg)
@@ -201,18 +261,35 @@ func TestCollectPortPlaceholders_Single(t *testing.T) {
 
 func TestCollectPortPlaceholders_Multiple(t *testing.T) {
 	cfg := &AruConfig{
-		Tmux: TmuxConfig{
-			"dev":  {Command: "npm run dev", Env: map[string]string{"PORT": "<PORT1>"}},
-			"api":  {Command: "node server.js", Env: map[string]string{"PORT": "<PORT2>"}},
-			"misc": {Command: "bash"},
+		Tmux: []TmuxWindowEntry{
+			{Command: "npm run dev", Env: map[string]string{"PORT": "<PORT1>"}},
+			{Command: "node server.js", Env: map[string]string{"PORT": "<PORT2>"}},
+			{Command: "bash"},
 		},
-		Proxy: &ProxyConfig{
-			Port: "<PORT1>",
+		Proxy: []ProxyConfig{
+			{Port: "<PORT1>"},
 		},
 	}
 	nums := collectPortPlaceholders(cfg)
 	if len(nums) != 2 || nums[0] != "1" || nums[1] != "2" {
 		t.Errorf("got %v, want [\"1\" \"2\"]", nums)
+	}
+}
+
+func TestCollectPortPlaceholders_TmuxAndProxyCombined(t *testing.T) {
+	cfg := &AruConfig{
+		Tmux: []TmuxWindowEntry{
+			{Command: "npm run dev -- --port <PORT1>"},
+			{Command: "echo <PORT2>"},
+		},
+		Proxy: []ProxyConfig{
+			{Name: "app1", Port: "<PORT1>"},
+			{Name: "app2", Port: "<PORT3>"},
+		},
+	}
+	nums := collectPortPlaceholders(cfg)
+	if len(nums) != 3 || nums[0] != "1" || nums[1] != "2" || nums[2] != "3" {
+		t.Errorf("got %v, want [\"1\" \"2\" \"3\"]", nums)
 	}
 }
 
@@ -233,9 +310,8 @@ func TestResolvePlaceholders_ProjectBranch(t *testing.T) {
 		Worktree: &WorktreeConfig{
 			Setup: []string{"echo <PROJECT>/<BRANCH>"},
 		},
-		Proxy: &ProxyConfig{
-			Name: "app.<BRANCH>.<PROJECT>",
-			Port: "3000",
+		Proxy: []ProxyConfig{
+			{Name: "app.<BRANCH>.<PROJECT>", Port: "3000"},
 		},
 	}
 	ports := map[int]int{}
@@ -248,22 +324,24 @@ func TestResolvePlaceholders_ProjectBranch(t *testing.T) {
 		t.Fatal("resolvePlaceholders() returned nil")
 	}
 
-	if len(resolved.Setup) != 1 || resolved.Setup[0] != "echo myproject/feature-x" {
-		t.Errorf("Setup[0] = %q, want 'echo myproject/feature-x'", resolved.Setup[0])
+	if resolved.Worktree == nil {
+		t.Fatal("resolved.Worktree is nil")
 	}
-	if resolved.Proxy.Name != "app.feature-x.myproject" {
-		t.Errorf("Proxy.Name = %q, want 'app.feature-x.myproject'", resolved.Proxy.Name)
+	if len(resolved.Worktree.Setup) != 1 || resolved.Worktree.Setup[0] != "echo myproject/feature-x" {
+		t.Errorf("Worktree.Setup[0] = %q, want 'echo myproject/feature-x'", resolved.Worktree.Setup[0])
+	}
+	if len(resolved.Proxy) != 1 || resolved.Proxy[0].Name != "app.feature-x.myproject" {
+		t.Errorf("Proxy[0].Name = %q, want 'app.feature-x.myproject'", resolved.Proxy[0].Name)
 	}
 }
 
 func TestResolvePlaceholders_PortAllocation(t *testing.T) {
 	cfg := &AruConfig{
-		Tmux: TmuxConfig{
-			"dev": {Command: "npm run dev", Env: map[string]string{"PORT": "<PORT1>"}},
+		Tmux: []TmuxWindowEntry{
+			{Name: "dev", Command: "npm run dev", Env: map[string]string{"PORT": "<PORT1>"}},
 		},
-		Proxy: &ProxyConfig{
-			Name: "myapp",
-			Port: "<PORT1>",
+		Proxy: []ProxyConfig{
+			{Name: "myapp", Port: "<PORT1>"},
 		},
 	}
 	ports := map[int]int{1: 3001}
@@ -274,19 +352,19 @@ func TestResolvePlaceholders_PortAllocation(t *testing.T) {
 	}
 
 	// Both PORT1 references should resolve to 3001
-	if resolved.Tmux["dev"].Env["PORT"] != "3001" {
-		t.Errorf("dev PORT = %q, want '3001'", resolved.Tmux["dev"].Env["PORT"])
+	if len(resolved.Tmux) != 1 || resolved.Tmux[0].Env["PORT"] != "3001" {
+		t.Errorf("Tmux[0].Env[PORT] = %q, want '3001'", resolved.Tmux[0].Env["PORT"])
 	}
-	if resolved.Proxy.Port != "3001" {
-		t.Errorf("Proxy.Port = %q, want '3001'", resolved.Proxy.Port)
+	if len(resolved.Proxy) != 1 || resolved.Proxy[0].Port != "3001" {
+		t.Errorf("Proxy[0].Port = %q, want '3001'", resolved.Proxy[0].Port)
 	}
 }
 
 func TestResolvePlaceholders_MultipleSamePort(t *testing.T) {
 	cfg := &AruConfig{
-		Tmux: TmuxConfig{
-			"dev": {Command: "npm run dev", Env: map[string]string{"PORT": "<PORT1>"}},
-			"api": {Command: "node api.js", Env: map[string]string{"PORT": "<PORT1>"}},
+		Tmux: []TmuxWindowEntry{
+			{Name: "dev", Command: "npm run dev", Env: map[string]string{"PORT": "<PORT1>"}},
+			{Name: "api", Command: "node api.js", Env: map[string]string{"PORT": "<PORT1>"}},
 		},
 	}
 	ports := map[int]int{1: 4000}
@@ -296,11 +374,14 @@ func TestResolvePlaceholders_MultipleSamePort(t *testing.T) {
 		t.Fatalf("resolvePlaceholders() returned error: %v", err)
 	}
 
-	if resolved.Tmux["dev"].Env["PORT"] != "4000" {
-		t.Errorf("dev PORT = %q, want '4000'", resolved.Tmux["dev"].Env["PORT"])
+	if len(resolved.Tmux) != 2 {
+		t.Fatalf("Tmux has %d entries, want 2", len(resolved.Tmux))
 	}
-	if resolved.Tmux["api"].Env["PORT"] != "4000" {
-		t.Errorf("api PORT = %q, want '4000'", resolved.Tmux["api"].Env["PORT"])
+	if resolved.Tmux[0].Env["PORT"] != "4000" {
+		t.Errorf("Tmux[0] PORT = %q, want '4000'", resolved.Tmux[0].Env["PORT"])
+	}
+	if resolved.Tmux[1].Env["PORT"] != "4000" {
+		t.Errorf("Tmux[1] PORT = %q, want '4000'", resolved.Tmux[1].Env["PORT"])
 	}
 }
 
@@ -316,22 +397,25 @@ func TestResolvePlaceholders_PreservesNonPlaceholders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolvePlaceholders() returned error: %v", err)
 	}
+	if resolved.Worktree == nil {
+		t.Fatal("resolved.Worktree is nil")
+	}
 
-	if len(resolved.Setup) != 2 {
-		t.Fatalf("got %d setup commands, want 2", len(resolved.Setup))
+	if len(resolved.Worktree.Setup) != 2 {
+		t.Fatalf("got %d setup commands, want 2", len(resolved.Worktree.Setup))
 	}
-	if resolved.Setup[0] != "echo hello world" {
-		t.Errorf("Setup[0] = %q, want 'echo hello world'", resolved.Setup[0])
+	if resolved.Worktree.Setup[0] != "echo hello world" {
+		t.Errorf("Setup[0] = %q, want 'echo hello world'", resolved.Worktree.Setup[0])
 	}
-	if resolved.Setup[1] != "npm install" {
-		t.Errorf("Setup[1] = %q, want 'npm install'", resolved.Setup[1])
+	if resolved.Worktree.Setup[1] != "npm install" {
+		t.Errorf("Setup[1] = %q, want 'npm install'", resolved.Worktree.Setup[1])
 	}
 }
 
 func TestResolvePlaceholders_PortInCommand(t *testing.T) {
 	cfg := &AruConfig{
-		Tmux: TmuxConfig{
-			"dev": {Command: "npm run dev -- --port <PORT1>"},
+		Tmux: []TmuxWindowEntry{
+			{Name: "dev", Command: "npm run dev -- --port <PORT1>"},
 		},
 	}
 	ports := map[int]int{1: 3001}
@@ -341,18 +425,13 @@ func TestResolvePlaceholders_PortInCommand(t *testing.T) {
 		t.Fatalf("resolvePlaceholders() returned error: %v", err)
 	}
 
-	if resolved.Tmux["dev"].Command != "npm run dev -- --port 3001" {
-		t.Errorf("Command = %q, want 'npm run dev -- --port 3001'", resolved.Tmux["dev"].Command)
+	if len(resolved.Tmux) != 1 || resolved.Tmux[0].Command != "npm run dev -- --port 3001" {
+		t.Errorf("Command = %q, want 'npm run dev -- --port 3001'", resolved.Tmux[0].Command)
 	}
 }
 
 // ── F2 regression: JSON metacharacters in project/branch names ────────────
 
-// TestResolvePlaceholders_JSONMetacharsInProject is the regression test for F2.
-// With the old marshal-replace-unmarshal approach, a project name containing
-// a JSON metacharacter like `"` would corrupt the marshaled JSON and cause
-// json.Unmarshal to fail. With the struct-walking approach, the project name
-// is substituted directly into Go string fields, bypassing JSON escaping.
 func TestResolvePlaceholders_JSONMetacharsInProject(t *testing.T) {
 	cfg := &AruConfig{
 		Worktree: &WorktreeConfig{
@@ -360,7 +439,6 @@ func TestResolvePlaceholders_JSONMetacharsInProject(t *testing.T) {
 		},
 	}
 
-	// Project name with a literal double-quote (would break JSON round-trip)
 	project := `my"project`
 	branch := `feature\x`
 
@@ -371,12 +449,15 @@ func TestResolvePlaceholders_JSONMetacharsInProject(t *testing.T) {
 	if resolved == nil {
 		t.Fatal("resolvePlaceholders() returned nil")
 	}
-	if len(resolved.Setup) != 1 {
-		t.Fatalf("got %d setup commands, want 1", len(resolved.Setup))
+	if resolved.Worktree == nil {
+		t.Fatal("resolved.Worktree is nil")
+	}
+	if len(resolved.Worktree.Setup) != 1 {
+		t.Fatalf("got %d setup commands, want 1", len(resolved.Worktree.Setup))
 	}
 	want := `echo my"project/feature\x`
-	if resolved.Setup[0] != want {
-		t.Errorf("Setup[0] = %q, want %q", resolved.Setup[0], want)
+	if resolved.Worktree.Setup[0] != want {
+		t.Errorf("Setup[0] = %q, want %q", resolved.Worktree.Setup[0], want)
 	}
 }
 
@@ -387,15 +468,14 @@ func TestResolvePlaceholders_BackslashInProject(t *testing.T) {
 		},
 	}
 
-	// Project name with a backslash (would break JSON round-trip escaping)
 	project := `path\to\project`
 
 	resolved, err := resolvePlaceholders(cfg, project, "main", map[int]int{})
 	if err != nil {
 		t.Fatalf("resolvePlaceholders() returned error for backslash name: %v", err)
 	}
-	if resolved.Setup[0] != `echo path\to\project` {
-		t.Errorf("Setup[0] = %q, want %q", resolved.Setup[0], `echo path\to\project`)
+	if resolved.Worktree.Setup[0] != `echo path\to\project` {
+		t.Errorf("Setup[0] = %q, want %q", resolved.Worktree.Setup[0], `echo path\to\project`)
 	}
 }
 
@@ -406,16 +486,19 @@ func TestResolvePlaceholders_UnicodeInProject(t *testing.T) {
 		},
 	}
 
-	project := "プロジェクト" // Japanese
-	branch := "ветка"   // Russian
+	project := "プロジェクト"
+	branch := "ветка"
 
 	resolved, err := resolvePlaceholders(cfg, project, branch, map[int]int{})
 	if err != nil {
 		t.Fatalf("resolvePlaceholders() returned error for unicode name: %v", err)
 	}
+	if resolved.Worktree == nil {
+		t.Fatal("resolved.Worktree is nil")
+	}
 	want := "echo " + project + "-" + branch
-	if resolved.Setup[0] != want {
-		t.Errorf("Setup[0] = %q, want %q", resolved.Setup[0], want)
+	if resolved.Worktree.Setup[0] != want {
+		t.Errorf("Setup[0] = %q, want %q", resolved.Worktree.Setup[0], want)
 	}
 }
 
@@ -426,15 +509,14 @@ func TestResolvePlaceholders_NewlineInProject(t *testing.T) {
 		},
 	}
 
-	// Project with newline (would break JSON output and confuse shell)
 	project := "line1\nline2"
 
 	resolved, err := resolvePlaceholders(cfg, project, "b", map[int]int{})
 	if err != nil {
 		t.Fatalf("resolvePlaceholders() returned error for newline name: %v", err)
 	}
-	if resolved.Setup[0] != "echo line1\nline2" {
-		t.Errorf("Setup[0] = %q, want %q", resolved.Setup[0], "echo line1\nline2")
+	if resolved.Worktree.Setup[0] != "echo line1\nline2" {
+		t.Errorf("Setup[0] = %q, want %q", resolved.Worktree.Setup[0], "echo line1\nline2")
 	}
 }
 
@@ -450,12 +532,8 @@ func TestResolveTeardownPlaceholders_JSONMetacharsInProject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveTeardownPlaceholders() returned error: %v", err)
 	}
-	// The project name is substituted verbatim. Note: this is by design
-	// — the command itself runs in bash, so this is a shell-injection risk
-	// in `aru.json` commands regardless of placeholder escaping. The F2 fix
-	// is about JSON parsing, not shell safety (that's F4's concern).
-	if resolved.Teardown[0] != `echo evil"; rm -rf /` {
-		t.Errorf("Teardown[0] = %q, want %q", resolved.Teardown[0], `echo evil"; rm -rf /`)
+	if resolved.Worktree.Teardown[0] != `echo evil"; rm -rf /` {
+		t.Errorf("Teardown[0] = %q, want %q", resolved.Worktree.Teardown[0], `echo evil"; rm -rf /`)
 	}
 }
 
@@ -464,15 +542,11 @@ func TestCollectPortPlaceholders_DoesNotPanicOnMetachars(t *testing.T) {
 		Worktree: &WorktreeConfig{
 			Setup: []string{`echo <PROJECT>:<PORT1>`},
 		},
-		Proxy: &ProxyConfig{
-			Name: `app-<PROJECT>`,
-			Port: `<PORT1>`,
+		Proxy: []ProxyConfig{
+			{Name: `app-<PROJECT>`, Port: `<PORT1>`},
 		},
 	}
 
-	// Project/branch aren't passed to collectPortPlaceholders, but the
-	// struct fields contain literal `<` and `>` from the placeholders.
-	// The walker should find <PORT1> regardless of metachars elsewhere.
 	nums := collectPortPlaceholders(cfg)
 	if len(nums) != 1 || nums[0] != "1" {
 		t.Errorf("collectPortPlaceholders = %v, want [\"1\"]", nums)
@@ -484,13 +558,13 @@ func TestResolvePlaceholders_DoesNotMutateOriginal(t *testing.T) {
 		Worktree: &WorktreeConfig{
 			Setup: []string{"echo <PROJECT>"},
 		},
-		Tmux: TmuxConfig{
-			"dev": {Command: "npm run dev", Env: map[string]string{"PORT": "<PORT1>"}},
+		Tmux: []TmuxWindowEntry{
+			{Name: "dev", Command: "npm run dev", Env: map[string]string{"PORT": "<PORT1>"}},
 		},
 	}
 	originalSetupSnapshot := original.Worktree.Setup[0]
-	originalCommandSnapshot := original.Tmux["dev"].Command
-	originalEnvSnapshot := original.Tmux["dev"].Env["PORT"]
+	originalCommandSnapshot := original.Tmux[0].Command
+	originalEnvSnapshot := original.Tmux[0].Env["PORT"]
 
 	_, err := resolvePlaceholders(original, "myproject", "feature-x", map[int]int{1: 3000})
 	if err != nil {
@@ -501,11 +575,11 @@ func TestResolvePlaceholders_DoesNotMutateOriginal(t *testing.T) {
 	if original.Worktree.Setup[0] != originalSetupSnapshot {
 		t.Errorf("original Setup[0] was mutated: got %q, want %q", original.Worktree.Setup[0], originalSetupSnapshot)
 	}
-	if original.Tmux["dev"].Command != originalCommandSnapshot {
-		t.Errorf("original Command was mutated: got %q, want %q", original.Tmux["dev"].Command, originalCommandSnapshot)
+	if original.Tmux[0].Command != originalCommandSnapshot {
+		t.Errorf("original Command was mutated: got %q, want %q", original.Tmux[0].Command, originalCommandSnapshot)
 	}
-	if original.Tmux["dev"].Env["PORT"] != originalEnvSnapshot {
-		t.Errorf("original Env[PORT] was mutated: got %q, want %q", original.Tmux["dev"].Env["PORT"], originalEnvSnapshot)
+	if original.Tmux[0].Env["PORT"] != originalEnvSnapshot {
+		t.Errorf("original Env[PORT] was mutated: got %q, want %q", original.Tmux[0].Env["PORT"], originalEnvSnapshot)
 	}
 }
 
@@ -536,9 +610,44 @@ func TestCloneConfig_PreservesAllFields(t *testing.T) {
 	}
 }
 
+// TestCloneConfig_PreservesArrayOrder tests that cloneConfig preserves
+// slice order for Tmux and Proxy slices.
+func TestCloneConfig_PreservesArrayOrder(t *testing.T) {
+	original := &AruConfig{
+		Tmux: []TmuxWindowEntry{
+			{Name: "first", Command: "echo 1"},
+			{Name: "second", Command: "echo 2"},
+			{Name: "third", Command: "echo 3"},
+		},
+		Proxy: []ProxyConfig{
+			{Name: "proxy-a", Port: "3000"},
+			{Name: "proxy-b", Port: "4000"},
+		},
+	}
+
+	clone := cloneConfig(original)
+	if clone == nil {
+		t.Fatal("cloneConfig returned nil")
+	}
+
+	// Verify Tmux order preserved
+	if len(clone.Tmux) != 3 {
+		t.Fatalf("Tmux has %d entries, want 3", len(clone.Tmux))
+	}
+	if clone.Tmux[0].Name != "first" || clone.Tmux[1].Name != "second" || clone.Tmux[2].Name != "third" {
+		t.Errorf("Tmux order not preserved: %+v", clone.Tmux)
+	}
+
+	// Verify Proxy order preserved
+	if len(clone.Proxy) != 2 {
+		t.Fatalf("Proxy has %d entries, want 2", len(clone.Proxy))
+	}
+	if clone.Proxy[0].Name != "proxy-a" || clone.Proxy[1].Name != "proxy-b" {
+		t.Errorf("Proxy order not preserved: %+v", clone.Proxy)
+	}
+}
+
 func TestResolvePlaceholders_PreservesSetupOneshot(t *testing.T) {
-	// End-to-end: parse aru.json with setup_oneshot=true, resolve, and verify
-	// the flag survives the resolution.
 	jsonContent := `{
 		"worktree": {
 			"setup": ["npm install"],
@@ -562,8 +671,83 @@ func TestResolvePlaceholders_PreservesSetupOneshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !resolved.SetupOneshot {
+	if resolved.Worktree == nil {
+		t.Fatal("resolved.Worktree is nil")
+	}
+	if !resolved.Worktree.SetupOneshot {
 		t.Error("resolvePlaceholders dropped SetupOneshot — cloneConfig bug regression")
+	}
+}
+
+// ── New test: ApplyPlaceholders for multiple tmux entries ──────────────────
+
+func TestApplyPlaceholders_MultipleTmuxEntries(t *testing.T) {
+	cfg := &AruConfig{
+		Tmux: []TmuxWindowEntry{
+			{Name: "dev", Command: "echo <PROJECT>:dev", Env: map[string]string{"PORT": "<PORT1>"}},
+			{Name: "api", Command: "echo <PROJECT>:api", Env: map[string]string{"PORT": "<PORT2>"}},
+		},
+	}
+	ports := map[int]int{1: 3000, 2: 4000}
+
+	applyPlaceholders(cfg, "myapp", "main", ports, true)
+
+	if len(cfg.Tmux) != 2 {
+		t.Fatalf("Tmux has %d entries, want 2", len(cfg.Tmux))
+	}
+	if cfg.Tmux[0].Command != "echo myapp:dev" {
+		t.Errorf("Tmux[0].Command = %q, want 'echo myapp:dev'", cfg.Tmux[0].Command)
+	}
+	if cfg.Tmux[0].Env["PORT"] != "3000" {
+		t.Errorf("Tmux[0].Env[PORT] = %q, want '3000'", cfg.Tmux[0].Env["PORT"])
+	}
+	if cfg.Tmux[1].Command != "echo myapp:api" {
+		t.Errorf("Tmux[1].Command = %q, want 'echo myapp:api'", cfg.Tmux[1].Command)
+	}
+	if cfg.Tmux[1].Env["PORT"] != "4000" {
+		t.Errorf("Tmux[1].Env[PORT] = %q, want '4000'", cfg.Tmux[1].Env["PORT"])
+	}
+}
+
+// ── New test: ApplyPlaceholders for multiple proxy entries ─────────────────
+
+func TestApplyPlaceholders_MultiProxy(t *testing.T) {
+	cfg := &AruConfig{
+		Proxy: []ProxyConfig{
+			{Name: "<PROJECT>-frontend", Port: "<PORT1>"},
+			{Name: "<PROJECT>-api", Port: "<PORT2>"},
+		},
+	}
+	ports := map[int]int{1: 3000, 2: 4000}
+
+	applyPlaceholders(cfg, "myapp", "main", ports, true)
+
+	if len(cfg.Proxy) != 2 {
+		t.Fatalf("Proxy has %d entries, want 2", len(cfg.Proxy))
+	}
+	if cfg.Proxy[0].Name != "myapp-frontend" || cfg.Proxy[0].Port != "3000" {
+		t.Errorf("Proxy[0] = %+v, want {Name: myapp-frontend, Port: 3000}", cfg.Proxy[0])
+	}
+	if cfg.Proxy[1].Name != "myapp-api" || cfg.Proxy[1].Port != "4000" {
+		t.Errorf("Proxy[1] = %+v, want {Name: myapp-api, Port: 4000}", cfg.Proxy[1])
+	}
+}
+
+func TestApplyPlaceholders_TmuxNameField(t *testing.T) {
+	cfg := &AruConfig{
+		Tmux: []TmuxWindowEntry{
+			{Name: "<PROJECT>-<BRANCH>", Command: "bash"},
+		},
+	}
+	ports := map[int]int{}
+
+	applyPlaceholders(cfg, "myapp", "feature-x", ports, true)
+
+	if len(cfg.Tmux) != 1 {
+		t.Fatalf("Tmux has %d entries, want 1", len(cfg.Tmux))
+	}
+	if cfg.Tmux[0].Name != "myapp-feature-x" {
+		t.Errorf("Tmux[0].Name = %q, want 'myapp-feature-x'", cfg.Tmux[0].Name)
 	}
 }
 
@@ -574,9 +758,8 @@ func TestResolveTeardownPlaceholders_NameOnly(t *testing.T) {
 		Worktree: &WorktreeConfig{
 			Teardown: []string{"echo tearing down <PROJECT>/<BRANCH>"},
 		},
-		Proxy: &ProxyConfig{
-			Name: "app.<BRANCH>.<PROJECT>",
-			Port: "<PORT1>",
+		Proxy: []ProxyConfig{
+			{Name: "app.<BRANCH>.<PROJECT>", Port: "<PORT1>"},
 		},
 	}
 
@@ -588,14 +771,18 @@ func TestResolveTeardownPlaceholders_NameOnly(t *testing.T) {
 		t.Fatal("resolveTeardownPlaceholders() returned nil")
 	}
 
+	if resolved.Worktree == nil {
+		t.Fatal("resolved.Worktree is nil")
+	}
+
 	// PROJECT and BRANCH resolved
-	if len(resolved.Teardown) != 1 || resolved.Teardown[0] != "echo tearing down myproject/feature-x" {
-		t.Errorf("Teardown[0] = %q, want 'echo tearing down myproject/feature-x'", resolved.Teardown[0])
+	if len(resolved.Worktree.Teardown) != 1 || resolved.Worktree.Teardown[0] != "echo tearing down myproject/feature-x" {
+		t.Errorf("Teardown[0] = %q, want 'echo tearing down myproject/feature-x'", resolved.Worktree.Teardown[0])
 	}
 
 	// PORTn left as literal (not resolved)
-	if resolved.Proxy.Port != "<PORT1>" {
-		t.Errorf("Proxy.Port = %q, want '<PORT1>' (should be literal)", resolved.Proxy.Port)
+	if len(resolved.Proxy) != 1 || resolved.Proxy[0].Port != "<PORT1>" {
+		t.Errorf("Proxy[0].Port = %q, want '<PORT1>' (should be literal)", resolved.Proxy[0].Port)
 	}
 }
 
@@ -641,7 +828,6 @@ func TestAllocatePorts_AllInRange(t *testing.T) {
 		t.Fatal("allocatePorts returned no ports")
 	}
 
-	// Verify all ports are in the valid range (best-effort uniqueness)
 	for num, port := range ports {
 		if port < 1024 || port >= 10000 {
 			t.Errorf("port %d for placeholder %d is out of range", port, num)

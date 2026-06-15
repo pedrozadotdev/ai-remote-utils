@@ -76,12 +76,17 @@ func TestLookupProxy_NoSubdomain(t *testing.T) {
 }
 
 func TestLookupProxy_MultipleLabels(t *testing.T) {
-	db := testProxyDB(t, map[string]int{"myapp": 3000})
+	db := testProxyDB(t, map[string]int{"snake.aru-test": 3000, "foo.bar": 8080})
 
-	// Multi-label subdomains (e.g., "foo.bar.test") are not supported
-	port, ok := LookupProxy("foo.bar.test", db)
-	if ok || port != 0 {
-		t.Errorf("LookupProxy('foo.bar.test') = (%d, %v), want (0, false)", port, ok)
+	// Multi-label subdomains (e.g., "snake.aru-test.test") are supported
+	port, ok := LookupProxy("snake.aru-test.test", db)
+	if !ok || port != 3000 {
+		t.Errorf("LookupProxy('snake.aru-test.test') = (%d, %v), want (3000, true)", port, ok)
+	}
+
+	port, ok = LookupProxy("FOO.BAR.TEST", db)
+	if !ok || port != 8080 {
+		t.Errorf("LookupProxy('FOO.BAR.TEST') = (%d, %v), want (8080, true)", port, ok)
 	}
 }
 

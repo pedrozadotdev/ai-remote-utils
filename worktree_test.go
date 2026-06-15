@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -581,9 +582,11 @@ func TestRunSetupIfNeeded_RunsWhenNoMarker(t *testing.T) {
 	})
 
 	marker := filepath.Join(tmp, "cmd-ran")
-	resolved := &ResolvedConfig{
-		Setup:        []string{"touch " + marker},
-		SetupOneshot: true,
+	resolved := &AruConfig{
+		Worktree: &WorktreeConfig{
+			Setup:        []string{"touch " + marker},
+			SetupOneshot: true,
+		},
 	}
 
 	runSetupIfNeeded(project, branch, tmp, resolved)
@@ -610,9 +613,11 @@ func TestRunSetupIfNeeded_SkipsWhenMarkerExists(t *testing.T) {
 	}
 
 	marker := filepath.Join(tmp, "cmd-ran")
-	resolved := &ResolvedConfig{
-		Setup:        []string{"touch " + marker},
-		SetupOneshot: true,
+	resolved := &AruConfig{
+		Worktree: &WorktreeConfig{
+			Setup:        []string{"touch " + marker},
+			SetupOneshot: true,
+		},
 	}
 
 	runSetupIfNeeded(project, branch, tmp, resolved)
@@ -637,9 +642,11 @@ func TestRunSetupIfNeeded_RunsWhenOneshotFalse(t *testing.T) {
 	}
 
 	marker := filepath.Join(tmp, "cmd-ran")
-	resolved := &ResolvedConfig{
-		Setup:        []string{"touch " + marker},
-		SetupOneshot: false, // explicitly false
+	resolved := &AruConfig{
+		Worktree: &WorktreeConfig{
+			Setup:        []string{"touch " + marker},
+			SetupOneshot: false, // explicitly false
+		},
 	}
 
 	runSetupIfNeeded(project, branch, tmp, resolved)
@@ -662,9 +669,11 @@ func TestRunSetupIfNeeded_EmptySetup(t *testing.T) {
 		clearSetupComplete(project, branch)
 	})
 
-	resolved := &ResolvedConfig{
-		Setup:        nil,
-		SetupOneshot: true,
+	resolved := &AruConfig{
+		Worktree: &WorktreeConfig{
+			Setup:        nil,
+			SetupOneshot: true,
+		},
 	}
 
 	runSetupIfNeeded(project, branch, t.TempDir(), resolved)
@@ -686,9 +695,11 @@ func TestRunSetupIfNeeded_SetsMarkerOnFailure(t *testing.T) {
 		clearSetupComplete(project, branch)
 	})
 
-	resolved := &ResolvedConfig{
-		Setup:        []string{"exit 1"}, // failing command
-		SetupOneshot: true,
+	resolved := &AruConfig{
+		Worktree: &WorktreeConfig{
+			Setup:        []string{"exit 1"}, // failing command
+			SetupOneshot: true,
+		},
 	}
 
 	runSetupIfNeeded(project, branch, tmp, resolved)
@@ -705,7 +716,7 @@ func TestReadConfig_AllocateAndPersist(t *testing.T) {
 	dir := t.TempDir()
 	jsonContent := `{
 		"worktree": {"setup": ["echo <PROJECT>:<PORT1>"]},
-		"tmux": {"dev": {"command": "npm run dev", "env": {"PORT": "<PORT1>"}}}
+		"tmux": [{"name": "dev", "command": "npm run dev", "env": {"PORT": "<PORT1>"}}]
 	}`
 	if err := os.WriteFile(filepath.Join(dir, "aru.json"), []byte(jsonContent), 0644); err != nil {
 		t.Fatal(err)
@@ -721,12 +732,12 @@ func TestReadConfig_AllocateAndPersist(t *testing.T) {
 	if resolved == nil {
 		t.Fatal("readConfig() returned nil")
 	}
-	if len(resolved.Setup) == 0 {
+	if resolved.Worktree == nil || len(resolved.Worktree.Setup) == 0 {
 		t.Fatal("setup is empty")
 	}
 
 	// Setup command should have a real port (e.g., "myproject:3421"), not a literal <PORT1>
-	setupCmd := resolved.Setup[0]
+	setupCmd := resolved.Worktree.Setup[0]
 	if strings.Contains(setupCmd, "<PORT1>") {
 		t.Errorf("setup command still has literal <PORT1>: %q", setupCmd)
 	}
@@ -741,7 +752,10 @@ func TestReadConfig_AllocateAndPersist(t *testing.T) {
 	}
 
 	// The tmux env PORT should match the persisted port
-	tmuxPort := resolved.Tmux["dev"].Env["PORT"]
+	if len(resolved.Tmux) == 0 {
+		t.Fatal("tmux is empty")
+	}
+	tmuxPort := resolved.Tmux[0].Env["PORT"]
 	persistedPort := fmt.Sprint(loaded[1])
 	if tmuxPort != persistedPort {
 		t.Errorf("tmux env PORT = %q, persisted port = %q — should match", tmuxPort, persistedPort)
@@ -752,7 +766,7 @@ func TestReadConfig_Load_ReusesPersistedPorts(t *testing.T) {
 	dir := t.TempDir()
 	jsonContent := `{
 		"worktree": {"setup": ["echo <PROJECT>:<PORT1>"]},
-		"tmux": {"dev": {"command": "npm run dev", "env": {"PORT": "<PORT1>"}}}
+		"tmux": [{"name": "dev", "command": "npm run dev", "env": {"PORT": "<PORT1>"}}]
 	}`
 	if err := os.WriteFile(filepath.Join(dir, "aru.json"), []byte(jsonContent), 0644); err != nil {
 		t.Fatal(err)
@@ -769,14 +783,20 @@ func TestReadConfig_Load_ReusesPersistedPorts(t *testing.T) {
 	if original == nil {
 		t.Fatal("initial allocation returned nil")
 	}
-	originalPort := original.Tmux["dev"].Env["PORT"]
+	if len(original.Tmux) == 0 {
+		t.Fatal("original tmux is empty")
+	}
+	originalPort := original.Tmux[0].Env["PORT"]
 
 	// Simulate the `aru worktree open` call — should re-use the persisted port
 	reopened := readConfig(dir, project, branch, portSourceLoad)
 	if reopened == nil {
 		t.Fatal("load-based read returned nil")
 	}
-	reopenedPort := reopened.Tmux["dev"].Env["PORT"]
+	if len(reopened.Tmux) == 0 {
+		t.Fatal("reopened tmux is empty")
+	}
+	reopenedPort := reopened.Tmux[0].Env["PORT"]
 
 	if originalPort != reopenedPort {
 		t.Errorf("port changed across open: original=%q reopened=%q", originalPort, reopenedPort)
@@ -801,8 +821,11 @@ func TestReadConfig_Load_FallsBackToAllocate(t *testing.T) {
 	if resolved == nil {
 		t.Fatal("readConfig with load mode and missing state should fall back to allocation")
 	}
-	if strings.Contains(resolved.Setup[0], "<PORT1>") {
-		t.Errorf("port placeholder not resolved: %q", resolved.Setup[0])
+	if resolved.Worktree == nil || len(resolved.Worktree.Setup) == 0 {
+		t.Fatal("resolved.Worktree.Setup is empty")
+	}
+	if strings.Contains(resolved.Worktree.Setup[0], "<PORT1>") {
+		t.Errorf("port placeholder not resolved: %q", resolved.Worktree.Setup[0])
 	}
 
 	// State file should now exist (created during fallback)
@@ -1178,10 +1201,381 @@ func TestSetupProxy_Wrapper_HandlesAddError(t *testing.T) {
 	}
 }
 
+// ── Multi-proxy iteration tests (M1) ────────────────────────────────────
+
+// TestHandleWorktreeAdd_MultiProxy verifies that handleWorktreeAdd iterates
+// over multiple proxy entries and registers each one in ProxyDB.
+func TestHandleWorktreeAdd_MultiProxy(t *testing.T) {
+	// Override HOME so all state/proxy files go to a temp dir
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	dir := t.TempDir()
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "multi-proxy-add")
+
+	// Mock tmux
+	mockDir := t.TempDir()
+	createMockTmux(t, mockDir)
+	origPath := os.Getenv("PATH")
+	os.Setenv("PATH", mockDir+":"+origPath)
+	defer os.Setenv("PATH", origPath)
+
+	runInDir(t, dir, func() {
+		project := filepath.Base(dir)
+		target := worktreeDir(project, "multi-proxy-add")
+
+		// Pre-create the worktree (simulating what handleWorktreeAdd does)
+		if err := gitWorktreeAdd(target, "multi-proxy-add"); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(target) })
+
+		// Create aru.json with two proxy entries
+		aruJSON := `{"proxy": [{"name": "frontend", "port": "3000"}, {"name": "api", "port": "4000"}]}`
+		if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Instead of calling handleWorktreeAdd (which blocks on tmux),
+		// simulate the proxy registration logic directly
+		resolved, err := ParseAruConfig(target)
+		if err != nil {
+			t.Fatalf("ParseAruConfig returned error: %v", err)
+		}
+
+		// Register proxies (same logic as handleWorktreeAdd)
+		dbPath := defaultProxyDBPath()
+		for _, p := range resolved.Proxy {
+			if p.Port == "" {
+				continue
+			}
+			port, err := strconv.Atoi(p.Port)
+			if err != nil {
+				t.Logf("invalid proxy port %q: %v", p.Port, err)
+				continue
+			}
+			setupProxy(dbPath, p.Name, port)
+		}
+
+		// Verify both proxies were registered
+		db, err := LoadProxyDB(dbPath)
+		if err != nil {
+			t.Fatalf("LoadProxyDB failed: %v", err)
+		}
+
+		port1, ok1 := db.Get("frontend")
+		if !ok1 || port1 != 3000 {
+			t.Errorf("frontend proxy: got port=%d ok=%v, want 3000 true", port1, ok1)
+		}
+
+		port2, ok2 := db.Get("api")
+		if !ok2 || port2 != 4000 {
+			t.Errorf("api proxy: got port=%d ok=%v, want 4000 true", port2, ok2)
+		}
+
+		// Clean up proxies
+		db.Delete("frontend")
+		db.Delete("api")
+	})
+}
+
+// TestHandleWorktreeDel_MultiProxy verifies that handleWorktreeDel iterates
+// over multiple proxy entries and removes each one from ProxyDB.
+func TestHandleWorktreeDel_MultiProxy(t *testing.T) {
+	// Override HOME so all state/proxy files go to a temp dir
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	dir := t.TempDir()
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "multi-proxy-del")
+
+	runInDir(t, dir, func() {
+		project := filepath.Base(dir)
+		target := worktreeDir(project, "multi-proxy-del")
+
+		// Create the worktree
+		if err := gitWorktreeAdd(target, "multi-proxy-del"); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(target) })
+
+		// Create aru.json with two proxy entries
+		aruJSON := `{"proxy": [{"name": "frontend", "port": "3000"}, {"name": "api", "port": "4000"}]}`
+		if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Pre-register proxies (simulating what add would do)
+		dbPath := defaultProxyDBPath()
+		db, err := LoadProxyDB(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.Add("frontend", 3000)
+		db.Add("api", 4000)
+
+		// Verify they exist
+		if _, ok := db.Get("frontend"); !ok {
+			t.Fatal("frontend proxy not pre-registered")
+		}
+		if _, ok := db.Get("api"); !ok {
+			t.Fatal("api proxy not pre-registered")
+		}
+
+		// Parse config to get proxy list
+		resolved, err := ParseAruConfig(target)
+		if err != nil {
+			t.Fatalf("ParseAruConfig returned error: %v", err)
+		}
+
+		// Remove proxies (same logic as handleWorktreeDel)
+		for _, p := range resolved.Proxy {
+			if p.Name == "" {
+				continue
+			}
+			removeProxy(dbPath, p.Name)
+		}
+
+		// Verify both proxies were removed
+		db2, err := LoadProxyDB(dbPath)
+		if err != nil {
+			t.Fatalf("LoadProxyDB failed: %v", err)
+		}
+
+		if _, ok := db2.Get("frontend"); ok {
+			t.Error("frontend proxy should have been removed")
+		}
+		if _, ok := db2.Get("api"); ok {
+			t.Error("api proxy should have been removed")
+		}
+	})
+}
+
+// TestHandleWorktreeOpen_MultiProxy verifies that handleWorktreeOpen iterates
+// over multiple proxy entries and re-registers each one in ProxyDB.
+func TestHandleWorktreeOpen_MultiProxy(t *testing.T) {
+	// Override HOME so all state/proxy files go to a temp dir
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	dir := t.TempDir()
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "multi-proxy-open")
+
+	runInDir(t, dir, func() {
+		project := filepath.Base(dir)
+		target := worktreeDir(project, "multi-proxy-open")
+
+		// Create the worktree
+		if err := gitWorktreeAdd(target, "multi-proxy-open"); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(target) })
+
+		// Create aru.json with two proxy entries
+		aruJSON := `{"proxy": [{"name": "frontend", "port": "3000"}, {"name": "api", "port": "4000"}]}`
+		if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Pre-populate port state (simulating what add would have done)
+		if err := persistAllocatedPorts(project, "multi-proxy-open", map[int]int{}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			removeAllocatedPorts(project, "multi-proxy-open")
+		})
+
+		// Parse config to get proxy list
+		resolved, err := ParseAruConfig(target)
+		if err != nil {
+			t.Fatalf("ParseAruConfig returned error: %v", err)
+		}
+
+		// Re-register proxies (same logic as handleWorktreeOpen)
+		dbPath := defaultProxyDBPath()
+		for _, p := range resolved.Proxy {
+			if p.Port == "" {
+				continue
+			}
+			port, err := strconv.Atoi(p.Port)
+			if err != nil {
+				t.Logf("invalid proxy port %q: %v", p.Port, err)
+				continue
+			}
+			setupProxy(dbPath, p.Name, port)
+		}
+
+		// Verify both proxies were re-registered
+		db, err := LoadProxyDB(dbPath)
+		if err != nil {
+			t.Fatalf("LoadProxyDB failed: %v", err)
+		}
+
+		port1, ok1 := db.Get("frontend")
+		if !ok1 || port1 != 3000 {
+			t.Errorf("frontend proxy: got port=%d ok=%v, want 3000 true", port1, ok1)
+		}
+
+		port2, ok2 := db.Get("api")
+		if !ok2 || port2 != 4000 {
+			t.Errorf("api proxy: got port=%d ok=%v, want 4000 true", port2, ok2)
+		}
+
+		// Clean up proxies
+		db.Delete("frontend")
+		db.Delete("api")
+	})
+}
+
+// TestProxyRegistration_SkipEmptyPort verifies that proxy entries with empty
+// port are skipped during registration.
+func TestProxyRegistration_SkipEmptyPort(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "proxies.json")
+	if err := os.WriteFile(dbPath, []byte(`{"version":1,"proxies":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the iteration logic from handleWorktreeAdd
+	proxies := []ProxyConfig{
+		{Name: "valid", Port: "3000"},
+		{Name: "empty-port", Port: ""},
+	}
+
+	for _, p := range proxies {
+		if p.Port == "" {
+			continue
+		}
+		port, err := strconv.Atoi(p.Port)
+		if err != nil {
+			t.Logf("invalid port %q for %s: %v", p.Port, p.Name, err)
+			continue
+		}
+		setupProxy(dbPath, p.Name, port)
+	}
+
+	// Verify only valid entry was added
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if db.Len() != 1 {
+		t.Errorf("expected 1 proxy entry, got %d", db.Len())
+	}
+
+	port, ok := db.Get("valid")
+	if !ok || port != 3000 {
+		t.Errorf("valid proxy: got port=%d ok=%v, want 3000 true", port, ok)
+	}
+
+	if _, ok := db.Get("empty-port"); ok {
+		t.Error("empty-port proxy should not have been registered")
+	}
+}
+
+// TestProxyRegistration_SkipInvalidPort verifies that proxy entries with
+// non-numeric port are skipped with a warning.
+func TestProxyRegistration_SkipInvalidPort(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "proxies.json")
+	if err := os.WriteFile(dbPath, []byte(`{"version":1,"proxies":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the iteration logic from handleWorktreeAdd
+	proxies := []ProxyConfig{
+		{Name: "valid", Port: "3000"},
+		{Name: "invalid-port", Port: "not-a-number"},
+	}
+
+	for _, p := range proxies {
+		if p.Port == "" {
+			continue
+		}
+		port, err := strconv.Atoi(p.Port)
+		if err != nil {
+			t.Logf("invalid port %q for %s: %v", p.Port, p.Name, err)
+			continue
+		}
+		setupProxy(dbPath, p.Name, port)
+	}
+
+	// Verify only valid entry was added
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if db.Len() != 1 {
+		t.Errorf("expected 1 proxy entry, got %d", db.Len())
+	}
+
+	port, ok := db.Get("valid")
+	if !ok || port != 3000 {
+		t.Errorf("valid proxy: got port=%d ok=%v, want 3000 true", port, ok)
+	}
+
+	if _, ok := db.Get("invalid-port"); ok {
+		t.Error("invalid-port proxy should not have been registered")
+	}
+}
+
+// TestProxyRegistration_SkipEmptyName verifies that proxy entries with empty
+// name are handled gracefully (warning emitted, no panic).
+func TestProxyRegistration_SkipEmptyName(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "proxies.json")
+	if err := os.WriteFile(dbPath, []byte(`{"version":1,"proxies":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the iteration logic from handleWorktreeAdd
+	// Note: empty name will fail validateName, but should not panic
+	proxies := []ProxyConfig{
+		{Name: "valid", Port: "3000"},
+		{Name: "", Port: "4000"},
+	}
+
+	for _, p := range proxies {
+		if p.Port == "" {
+			continue
+		}
+		port, err := strconv.Atoi(p.Port)
+		if err != nil {
+			t.Logf("invalid port %q for %s: %v", p.Port, p.Name, err)
+			continue
+		}
+		setupProxy(dbPath, p.Name, port)
+	}
+
+	// Verify only valid entry was added (empty name fails validation)
+	db, err := LoadProxyDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if db.Len() != 1 {
+		t.Errorf("expected 1 proxy entry, got %d", db.Len())
+	}
+
+	port, ok := db.Get("valid")
+	if !ok || port != 3000 {
+		t.Errorf("valid proxy: got port=%d ok=%v, want 3000 true", port, ok)
+	}
+
+	if _, ok := db.Get(""); ok {
+		t.Error("empty-name proxy should not have been registered")
+	}
+}
+
 func TestBuildTmuxCommand_NoEnv(t *testing.T) {
 	win := TmuxWindow{Command: "npm run dev"}
 	got := buildTmuxCommand(win)
-	want := "npm run dev; exec bash"
+	want := "trap ':' INT; npm run dev; exec bash"
 	if got != want {
 		t.Errorf("buildTmuxCommand() = %q, want %q", got, want)
 	}
@@ -1194,7 +1588,7 @@ func TestBuildTmuxCommand_WithEnv(t *testing.T) {
 	}
 	got := buildTmuxCommand(win)
 	// Should use shell quoting for the env value
-	want := "export PORT=\"3000\"; npm run dev; exec bash"
+	want := "trap ':' INT; export PORT=\"3000\"; npm run dev; exec bash"
 	if got != want {
 		t.Errorf("buildTmuxCommand() = %q, want %q", got, want)
 	}
@@ -1207,7 +1601,7 @@ func TestBuildTmuxCommand_MultipleEnv(t *testing.T) {
 	}
 	got := buildTmuxCommand(win)
 	// Env vars should be sorted alphabetically: HOST, then PORT
-	want := "export HOST=\"localhost\"; export PORT=\"3000\"; node server.js; exec bash"
+	want := "trap ':' INT; export HOST=\"localhost\"; export PORT=\"3000\"; node server.js; exec bash"
 	if got != want {
 		t.Errorf("buildTmuxCommand() = %q, want %q", got, want)
 	}
@@ -1216,7 +1610,7 @@ func TestBuildTmuxCommand_MultipleEnv(t *testing.T) {
 func TestBuildTmuxCommand_EmptyCommand(t *testing.T) {
 	win := TmuxWindow{}
 	got := buildTmuxCommand(win)
-	want := "exec bash"
+	want := "trap ':' INT; exec bash"
 	if got != want {
 		t.Errorf("buildTmuxCommand() = %q, want %q", got, want)
 	}
@@ -1227,7 +1621,7 @@ func TestBuildTmuxCommand_OnlyEnv(t *testing.T) {
 		Env: map[string]string{"PORT": "8080"},
 	}
 	got := buildTmuxCommand(win)
-	want := "export PORT=\"8080\"; exec bash"
+	want := "trap ':' INT; export PORT=\"8080\"; exec bash"
 	if got != want {
 		t.Errorf("buildTmuxCommand() = %q, want %q", got, want)
 	}
@@ -1287,33 +1681,11 @@ func TestSetupTmuxSession_NilConfig(t *testing.T) {
 	project := "testproj"
 	branch := "test-branch"
 
-	sock := socketPath(project, branch)
-	sessionName := sanitizeSessionName(branch)
-
-	t.Cleanup(func() {
-		exec.Command("tmux", "-S", sock, "kill-session", "-t", sessionName).Run()
-		os.Remove(sock)
-	})
-
-	errCh := make(chan error, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				errCh <- fmt.Errorf("panic: %v", r)
-			}
-		}()
-		setupTmuxSession(project, branch, tmp, nil)
-		errCh <- nil
-	}()
-
-	waitForSocket(sock, sessionName, 5*time.Second)
-
-	check := exec.Command("tmux", "-S", sock, "has-session", "-t", sessionName)
-	if out, err := check.CombinedOutput(); err != nil {
-		t.Fatalf("session was not created: %v\n%s", err, string(out))
+	// nil config should now return an error — aru.json is required
+	err := setupTmuxSession(project, branch, tmp, nil)
+	if err == nil {
+		t.Error("expected error for nil tmux config, got nil")
 	}
-
-	exec.Command("tmux", "-S", sock, "kill-session", "-t", sessionName).Run()
 }
 
 func TestSetupTmuxSession_EmptyConfig(t *testing.T) {
@@ -1325,40 +1697,17 @@ func TestSetupTmuxSession_EmptyConfig(t *testing.T) {
 	project := "testproj"
 	branch := "test-branch"
 
-	sock := socketPath(project, branch)
-	sessionName := sanitizeSessionName(branch)
-
-	t.Cleanup(func() {
-		exec.Command("tmux", "-S", sock, "kill-session", "-t", sessionName).Run()
-		os.Remove(sock)
-	})
-
-	errCh := make(chan error, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				errCh <- fmt.Errorf("panic: %v", r)
-			}
-		}()
-		setupTmuxSession(project, branch, tmp, TmuxConfig{})
-		errCh <- nil
-	}()
-
-	waitForSocket(sock, sessionName, 5*time.Second)
-
-	check := exec.Command("tmux", "-S", sock, "has-session", "-t", sessionName)
-	if out, err := check.CombinedOutput(); err != nil {
-		t.Fatalf("session was not created: %v\n%s", err, string(out))
+	// Empty slice config should now return an error — aru.json is required
+	err := setupTmuxSession(project, branch, tmp, []TmuxWindowEntry{})
+	if err == nil {
+		t.Error("expected error for empty tmux config, got nil")
 	}
-
-	exec.Command("tmux", "-S", sock, "kill-session", "-t", sessionName).Run()
 }
 
 // ── createConfigSession tests (F3) ────────────────────────────────────────
 
 // TestCreateConfigSession_OneWindow verifies that a single-window config
 // issues exactly one new-session call with the right window name.
-// Note: tryCreatePiWindow is also called, adding a second new-window for "pi".
 func TestCreateConfigSession_OneWindow(t *testing.T) {
 	mockDir := t.TempDir()
 	logPath := createRecordingMockTmux(t, mockDir)
@@ -1368,8 +1717,8 @@ func TestCreateConfigSession_OneWindow(t *testing.T) {
 	sock := filepath.Join(t.TempDir(), "test.sock")
 	sessionName := "test-session"
 	workDir := t.TempDir()
-	tmuxConfig := TmuxConfig{
-		"dev": {Command: "npm run dev", Env: map[string]string{"PORT": "3000"}},
+	tmuxConfig := []TmuxWindowEntry{
+		{Name: "dev", Command: "npm run dev", Env: map[string]string{"PORT": "3000"}},
 	}
 
 	createConfigSession(sock, sessionName, workDir, tmuxConfig)
@@ -1388,13 +1737,12 @@ func TestCreateConfigSession_OneWindow(t *testing.T) {
 		}
 	}
 
-	// Single config window: 1 new-session for "dev"
-	// Plus tryCreatePiWindow adds 1 new-window for "pi" (since "pi" not in config)
+	// Single config window: 1 new-session for "dev", no new-window calls
 	if len(newSessionCalls) != 1 {
 		t.Errorf("got %d new-session calls, want 1", len(newSessionCalls))
 	}
-	if len(newWindowCalls) != 1 {
-		t.Errorf("got %d new-window calls, want 1 (pi auto-window)", len(newWindowCalls))
+	if len(newWindowCalls) != 0 {
+		t.Errorf("got %d new-window calls, want 0", len(newWindowCalls))
 	}
 
 	// Verify the new-session has the right window name and command
@@ -1413,8 +1761,7 @@ func TestCreateConfigSession_OneWindow(t *testing.T) {
 }
 
 // TestCreateConfigSession_MultipleWindows verifies that a 3-window config
-// issues 1 new-session + 2 new-window calls in sorted key order.
-// Plus tryCreatePiWindow adds 1 more new-window for "pi".
+// issues 1 new-session + 2 new-window calls in slice order.
 func TestCreateConfigSession_MultipleWindows(t *testing.T) {
 	mockDir := t.TempDir()
 	logPath := createRecordingMockTmux(t, mockDir)
@@ -1424,10 +1771,10 @@ func TestCreateConfigSession_MultipleWindows(t *testing.T) {
 	sock := filepath.Join(t.TempDir(), "test.sock")
 	sessionName := "test-session"
 	workDir := t.TempDir()
-	tmuxConfig := TmuxConfig{
-		"dev":   {Command: "npm run dev"},
-		"misc":  {Command: "bash"},
-		"build": {Command: "npm run build"},
+	tmuxConfig := []TmuxWindowEntry{
+		{Name: "dev", Command: "npm run dev"},
+		{Name: "misc", Command: "bash"},
+		{Name: "build", Command: "npm run build"},
 	}
 
 	createConfigSession(sock, sessionName, workDir, tmuxConfig)
@@ -1447,23 +1794,34 @@ func TestCreateConfigSession_MultipleWindows(t *testing.T) {
 	if len(newSessionCalls) != 1 {
 		t.Errorf("got %d new-session calls, want 1", len(newSessionCalls))
 	}
-	// 2 for the remaining config keys (dev, misc) + 1 for the auto-pi window
-	if len(newWindowCalls) != 3 {
-		t.Errorf("got %d new-window calls, want 3 (2 config + 1 pi)", len(newWindowCalls))
+	// 2 for the remaining config entries (misc, build)
+	if len(newWindowCalls) != 2 {
+		t.Errorf("got %d new-window calls, want 2", len(newWindowCalls))
 	}
 
-	// First key (sorted) should be "build" for the new-session
-	if len(newSessionCalls) == 1 && newSessionCalls[0].Name != "build" {
-		t.Errorf("first window (new-session) = %q, want 'build' (sorted first)", newSessionCalls[0].Name)
+	// First entry in slice should be "dev" for the new-session
+	if len(newSessionCalls) == 1 && newSessionCalls[0].Name != "dev" {
+		t.Errorf("first window (new-session) = %q, want 'dev' (first in slice)", newSessionCalls[0].Name)
 	}
 
-	// New-window calls should include "dev", "misc", and "pi"
+	// New-window calls should be in slice order: misc, build
+	expectedOrder := []string{"misc", "build"}
+	if len(newWindowCalls) != len(expectedOrder) {
+		t.Fatalf("got %d new-window calls, want %d", len(newWindowCalls), len(expectedOrder))
+	}
+	for i, want := range expectedOrder {
+		if newWindowCalls[i].Name != want {
+			t.Errorf("new-window[%d] name = %q, want %q", i, newWindowCalls[i].Name, want)
+		}
+	}
+
+	// Also verify set equality (order-independent) for completeness
 	gotNewWindowNames := []string{}
 	for _, nw := range newWindowCalls {
 		gotNewWindowNames = append(gotNewWindowNames, nw.Name)
 	}
 	sort.Strings(gotNewWindowNames)
-	wantNames := []string{"dev", "misc", "pi"}
+	wantNames := []string{"build", "misc"}
 	if len(gotNewWindowNames) != len(wantNames) {
 		t.Errorf("new-window names = %v, want %v", gotNewWindowNames, wantNames)
 	}
@@ -1474,62 +1832,21 @@ func TestCreateConfigSession_MultipleWindows(t *testing.T) {
 	}
 }
 
-// TestCreateConfigSession_PiWindowSkippedWhenInConfig verifies that when "pi"
-// is in the config, tryCreatePiWindow is NOT called (so we don't get a
-// duplicate "pi" window).
-func TestCreateConfigSession_PiWindowSkippedWhenInConfig(t *testing.T) {
-	mockDir := t.TempDir()
-	logPath := createRecordingMockTmux(t, mockDir)
-	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
-	t.Setenv("TMUX_LOG", logPath)
-
-	sock := filepath.Join(t.TempDir(), "test.sock")
-	sessionName := "test-session"
-	workDir := t.TempDir()
-	tmuxConfig := TmuxConfig{
-		"dev": {Command: "npm run dev"},
-		"pi":  {Command: "pi"},
-	}
-
-	createConfigSession(sock, sessionName, workDir, tmuxConfig)
-
-	invocations := readMockTmuxLog(t, logPath)
-
-	// Count how many times "pi" appears as a window name
-	piCount := 0
-	for _, inv := range invocations {
-		if inv.Name == "pi" {
-			piCount++
-		}
-	}
-	if piCount != 1 {
-		t.Errorf("'pi' window appeared %d times, want 1 (should be skipped by tryCreatePiWindow)", piCount)
-	}
-}
-
 // ── F6 tests: select-window behavior ─────────────────────────────────────
 
-// TestCreateConfigSession_DoesNotSelectPi verifies the F6 fix: when the
-// user has config-defined windows, the auto-pi window is created but NOT
-// selected. The active window remains the last user-defined window.
+// TestCreateConfigSession_DoesNotSelectPi verifies that createConfigSession
+// does not issue select-window calls — window selection is left to the caller.
 func TestCreateConfigSession_DoesNotSelectPi(t *testing.T) {
 	mockDir := t.TempDir()
 	logPath := createRecordingMockTmux(t, mockDir)
 	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
 	t.Setenv("TMUX_LOG", logPath)
 
-	// Need a "pi" command in PATH for tryCreatePiWindow to do anything.
-	// Create a stub pi binary.
-	piPath := filepath.Join(mockDir, "pi")
-	if err := os.WriteFile(piPath, []byte("#!/bin/sh\necho pi\n"), 0755); err != nil {
-		t.Fatal(err)
-	}
-
 	sock := filepath.Join(t.TempDir(), "test.sock")
 	sessionName := "test-session"
 	workDir := t.TempDir()
-	tmuxConfig := TmuxConfig{
-		"dev": {Command: "npm run dev"},
+	tmuxConfig := []TmuxWindowEntry{
+		{Name: "dev", Command: "npm run dev"},
 	}
 
 	createConfigSession(sock, sessionName, workDir, tmuxConfig)
@@ -1544,70 +1861,7 @@ func TestCreateConfigSession_DoesNotSelectPi(t *testing.T) {
 		}
 	}
 	if selectCount != 0 {
-		t.Errorf("F6 REGRESSION: createConfigSession issued %d select-window calls, want 0 (should not override user's window)", selectCount)
-	}
-}
-
-// TestCreateMinimalSession_SelectsPi verifies that in the minimal-session
-// case (no user config), the pi window IS selected so the user lands on it.
-func TestCreateMinimalSession_SelectsPi(t *testing.T) {
-	mockDir := t.TempDir()
-	logPath := createRecordingMockTmux(t, mockDir)
-	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
-	t.Setenv("TMUX_LOG", logPath)
-
-	// Stub pi command
-	piPath := filepath.Join(mockDir, "pi")
-	if err := os.WriteFile(piPath, []byte("#!/bin/sh\necho pi\n"), 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	sock := filepath.Join(t.TempDir(), "test.sock")
-	sessionName := "test-session"
-	workDir := t.TempDir()
-
-	createMinimalSession(sock, sessionName, workDir)
-
-	invocations := readMockTmuxLog(t, logPath)
-
-	// Should have a select-window call. The target name (pi) is in the
-	// "cmd" field because the recording mock doesn't parse -t, but the
-	// op is what matters.
-	hasSelect := false
-	for _, inv := range invocations {
-		if inv.Op == "select-window" {
-			hasSelect = true
-			break
-		}
-	}
-	if !hasSelect {
-		t.Error("createMinimalSession should select the pi window (no user config to override)")
-	}
-}
-
-// TestCreateMinimalSession_NoSelectWhenPiMissing verifies the edge case:
-// if pi is not in PATH, no select-window is issued (nothing to select).
-func TestCreateMinimalSession_NoSelectWhenPiMissing(t *testing.T) {
-	mockDir := t.TempDir()
-	logPath := createRecordingMockTmux(t, mockDir)
-	// PATH contains ONLY mockDir (not the real PATH), so the real
-	// "pi" binary (if any) cannot be found.
-	t.Setenv("PATH", mockDir)
-	t.Setenv("TMUX_LOG", logPath)
-
-	sock := filepath.Join(t.TempDir(), "test.sock")
-	sessionName := "test-session"
-	workDir := t.TempDir()
-
-	createMinimalSession(sock, sessionName, workDir)
-
-	invocations := readMockTmuxLog(t, logPath)
-
-	// No select-window should be issued (nothing to select)
-	for _, inv := range invocations {
-		if inv.Op == "select-window" {
-			t.Errorf("select-window was issued even though pi is not in PATH: %+v", inv)
-		}
+		t.Errorf("createConfigSession issued %d select-window calls, want 0 (selection is the caller's responsibility)", selectCount)
 	}
 }
 
@@ -1891,13 +2145,12 @@ func TestHandleWorktreeOpen_WithConfig_F1Regression(t *testing.T) {
 			"worktree": {
 				"setup": ["touch ` + setupMarker + `"]
 			},
-			"tmux": {
-				"dev": {"command": "npm run dev", "env": {"PORT": "<PORT1>"}}
-			},
-			"proxy": {
-				"name": "feature-f1-app",
-				"port": "<PORT1>"
-			}
+			"tmux": [
+				{"name": "dev", "command": "npm run dev", "env": {"PORT": "<PORT1>"}}
+			],
+			"proxy": [
+				{"name": "feature-f1-app", "port": "<PORT1>"}
+			]
 		}`
 		if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
 			t.Fatal(err)

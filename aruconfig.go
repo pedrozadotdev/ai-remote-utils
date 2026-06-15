@@ -15,10 +15,10 @@ import (
 
 // AruConfig represents the aru.json configuration file.
 type AruConfig struct {
-	Version  int             `json:"version,omitempty"`
-	Worktree *WorktreeConfig `json:"worktree,omitempty"`
-	Tmux     TmuxConfig      `json:"tmux,omitempty"`
-	Proxy    *ProxyConfig    `json:"proxy,omitempty"`
+	Version  int               `json:"version,omitempty"`
+	Worktree *WorktreeConfig   `json:"worktree,omitempty"`
+	Tmux     []TmuxWindowEntry `json:"tmux,omitempty"`
+	Proxy    []ProxyConfig     `json:"proxy,omitempty"`
 }
 
 // WorktreeConfig defines setup and teardown command lists.
@@ -28,10 +28,14 @@ type WorktreeConfig struct {
 	Teardown     []string `json:"teardown,omitempty"`
 }
 
-// TmuxConfig maps window names to their configuration.
-type TmuxConfig map[string]TmuxWindow
+// TmuxWindowEntry is an ordered tmux window entry with a name field.
+type TmuxWindowEntry struct {
+	Name    string            `json:"name"`
+	Command string            `json:"command"`
+	Env     map[string]string `json:"env,omitempty"`
+}
 
-// TmuxWindow defines a single tmux window with optional env vars.
+// TmuxWindow defines a single tmux window with optional env vars (used internally).
 type TmuxWindow struct {
 	Command string            `json:"command"`
 	Env     map[string]string `json:"env,omitempty"`
@@ -41,15 +45,6 @@ type TmuxWindow struct {
 type ProxyConfig struct {
 	Name string `json:"name"`
 	Port string `json:"port"` // e.g. "<PORT1>" or a literal port string
-}
-
-// ResolvedConfig is the output after placeholder resolution.
-type ResolvedConfig struct {
-	Setup        []string
-	SetupOneshot bool
-	Teardown     []string
-	Tmux         TmuxConfig
-	Proxy        *ProxyConfig
 }
 
 // ── Regex ──────────────────────────────────────────────────────────────────
@@ -103,16 +98,16 @@ func collectPortPlaceholders(cfg *AruConfig) []string {
 		}
 	}
 
-	for _, win := range cfg.Tmux {
-		collectPortNumbers(win.Command, seen)
-		for _, v := range win.Env {
+	for _, entry := range cfg.Tmux {
+		collectPortNumbers(entry.Command, seen)
+		for _, v := range entry.Env {
 			collectPortNumbers(v, seen)
 		}
 	}
 
-	if cfg.Proxy != nil {
-		collectPortNumbers(cfg.Proxy.Name, seen)
-		collectPortNumbers(cfg.Proxy.Port, seen)
+	for _, p := range cfg.Proxy {
+		collectPortNumbers(p.Name, seen)
+		collectPortNumbers(p.Port, seen)
 	}
 
 	if len(seen) == 0 {
@@ -179,26 +174,26 @@ func allocatePorts(placeholderNums []string) map[int]int {
 // the string level. This is robust against project/branch names containing
 // JSON metacharacters (", \, control chars) — the previous marshal-replace-
 // unmarshal approach would have corrupted the JSON in those cases.
-func resolvePlaceholders(cfg *AruConfig, project, branch string, ports map[int]int) (*ResolvedConfig, error) {
+func resolvePlaceholders(cfg *AruConfig, project, branch string, ports map[int]int) (*AruConfig, error) {
 	if cfg == nil {
 		return nil, nil
 	}
 
 	clone := cloneConfig(cfg)
 	applyPlaceholders(clone, project, branch, ports, true)
-	return flattenConfig(clone), nil
+	return clone, nil
 }
 
 // resolveTeardownPlaceholders performs name-only resolution: <PROJECT> and
 // <BRANCH> are replaced, but <PORTn> placeholders are left as literals.
-func resolveTeardownPlaceholders(cfg *AruConfig, project, branch string) (*ResolvedConfig, error) {
+func resolveTeardownPlaceholders(cfg *AruConfig, project, branch string) (*AruConfig, error) {
 	if cfg == nil {
 		return nil, nil
 	}
 
 	clone := cloneConfig(cfg)
 	applyPlaceholders(clone, project, branch, nil, false)
-	return flattenConfig(clone), nil
+	return clone, nil
 }
 
 // applyPlaceholders walks all string-typed fields in cfg and replaces
@@ -214,17 +209,19 @@ func applyPlaceholders(cfg *AruConfig, project, branch string, ports map[int]int
 		}
 	}
 
-	for name, win := range cfg.Tmux {
-		win.Command = replaceInString(win.Command, project, branch, ports, resolvePorts)
-		for k, v := range win.Env {
-			win.Env[k] = replaceInString(v, project, branch, ports, resolvePorts)
+	for i, entry := range cfg.Tmux {
+		entry.Name = replaceInString(entry.Name, project, branch, ports, resolvePorts)
+		entry.Command = replaceInString(entry.Command, project, branch, ports, resolvePorts)
+		for k, v := range entry.Env {
+			entry.Env[k] = replaceInString(v, project, branch, ports, resolvePorts)
 		}
-		cfg.Tmux[name] = win
+		cfg.Tmux[i] = entry
 	}
 
-	if cfg.Proxy != nil {
-		cfg.Proxy.Name = replaceInString(cfg.Proxy.Name, project, branch, ports, resolvePorts)
-		cfg.Proxy.Port = replaceInString(cfg.Proxy.Port, project, branch, ports, resolvePorts)
+	for i, p := range cfg.Proxy {
+		p.Name = replaceInString(p.Name, project, branch, ports, resolvePorts)
+		p.Port = replaceInString(p.Port, project, branch, ports, resolvePorts)
+		cfg.Proxy[i] = p
 	}
 }
 
@@ -278,37 +275,26 @@ func cloneConfig(cfg *AruConfig) *AruConfig {
 	}
 
 	if cfg.Tmux != nil {
-		clone.Tmux = make(TmuxConfig, len(cfg.Tmux))
-		for name, win := range cfg.Tmux {
-			newWin := TmuxWindow{Command: win.Command}
-			if win.Env != nil {
-				newWin.Env = make(map[string]string, len(win.Env))
-				for k, v := range win.Env {
-					newWin.Env[k] = v
+		clone.Tmux = make([]TmuxWindowEntry, len(cfg.Tmux))
+		for i, entry := range cfg.Tmux {
+			newEntry := TmuxWindowEntry{
+				Name:    entry.Name,
+				Command: entry.Command,
+			}
+			if entry.Env != nil {
+				newEntry.Env = make(map[string]string, len(entry.Env))
+				for k, v := range entry.Env {
+					newEntry.Env[k] = v
 				}
 			}
-			clone.Tmux[name] = newWin
+			clone.Tmux[i] = newEntry
 		}
 	}
 
 	if cfg.Proxy != nil {
-		p := *cfg.Proxy
-		clone.Proxy = &p
+		clone.Proxy = make([]ProxyConfig, len(cfg.Proxy))
+		copy(clone.Proxy, cfg.Proxy)
 	}
 
 	return clone
-}
-
-// flattenConfig converts a resolved AruConfig into a ResolvedConfig.
-func flattenConfig(cfg *AruConfig) *ResolvedConfig {
-	result := &ResolvedConfig{
-		Tmux:  cfg.Tmux,
-		Proxy: cfg.Proxy,
-	}
-	if cfg.Worktree != nil {
-		result.Setup = cfg.Worktree.Setup
-		result.SetupOneshot = cfg.Worktree.SetupOneshot
-		result.Teardown = cfg.Worktree.Teardown
-	}
-	return result
 }

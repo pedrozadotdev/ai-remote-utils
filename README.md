@@ -88,8 +88,7 @@ aru worktree list
 ```
 
 - Worktrees stored at `~/.aru/wt/<project>/<branch>`
-- RAM-backed data at `~/.aru/ram/<project>/<branch>` (tmpfs via `syscall.Mount`), with per-entry subdirectories configured via `aru.json` `ramdir` — each entry gets its own tmpfs mount and a symlink at the configured worktree-relative path
-- Symlinks created for each `ramdir` entry (e.g., `<worktree>/data` → `~/.aru/ram/<project>/<branch>/data`)
+- RAM-backed data at `~/.aru/wt/<project>/<branch>/<path>` (tmpfs via `syscall.Mount`), configured via `aru.json` `ramdir` — each entry gets its own tmpfs mount directly in the worktree, no symlinks
 - Tmux sessions managed via custom sockets at `~/.aru/sockets/<project>-<branch>.sock`
 - **Config-driven lifecycle via `aru.json`**: declaratively specify setup commands, teardown commands, tmux windows, and reverse proxy registration — see [aru.json schema](#🔐-trust-model-for-arujson-commands) below
 - Port persistence: allocated ports survive reboots via `~/.aru/state/<project>/<branch>/ports.json`
@@ -158,10 +157,8 @@ Because you already have full shell access, the commands in `aru.json` provide n
   - `name` — proxy name with `<PROJECT>`/`<BRANCH>` placeholders for dynamic naming. Can contain dots for multi-level subdomains (e.g., `api.myapp.test`).
   - `port` — port with `<PORT1>`/`<PORT2>`/... placeholders (allocated from 1024-9999)
 - `ramdir` — **array** of RAM-backed tmpfs directory entries. Each entry has:
-  - `path` — worktree-relative path for the symlink (e.g., `"data"`, `"cache/build"`). Parent directories are created automatically.
+  - `path` — worktree-relative path for the tmpfs mount point (e.g., `"data"`, `"cache/build"`). Parent directories are created automatically.
   - `size` — optional tmpfs size specifier (e.g., `"200M"`, `"1G"`). Defaults to `"200M"` when omitted.
-
-  > **⚠️ Breaking change:** Previously, every worktree automatically got a `data` directory with a hardcoded 200M tmpfs mount. With the `ramdir` config, no RAM directories are created unless you explicitly add a `ramdir` entry. To restore the old default behavior, add `"ramdir": [{"path": "data"}]` to your `aru.json`.
 
 **SIGINT behavior:** Tmux commands get a `trap ':' INT` handler so the outer shell survives Ctrl+C and drops into a fallback bash shell. Child processes remain interruptible (default SIG_DFL disposition). This prevents accidentally closing the entire tmux window when pressing Ctrl+C on a dev server.
 
@@ -283,7 +280,6 @@ All persistent data lives under `~/.aru/`:
 ├── proxies.json      — Reverse proxy configuration
 ├── state/            — Per-worktree state (ports.json, setup-complete)
 ├── wt/               — Git worktrees (<project>/<branch>)
-├── ram/              — RAM-backed data (tmpfs, <project>/<branch>)
 └── sockets/          — Tmux control sockets (<project>-<branch>.sock)
 ```
 

@@ -14,8 +14,8 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 | Change reverse proxy | `proxy.go` — `LookupProxy`, `NewReverseProxy`; `proxy_test.go` |
 | Change proxy persistence | `proxydb.go` — ProxyDB (Load/Save/Add/Delete/Get/List/Refresh); `proxydb_test.go` |
 | Change proxy management CLI | `main.go` — `handleProxySubcommand`, `handleProxyAdd`, `handleProxyDel`, `handleProxyList` |
-| Change aru.json config parsing | `aruconfig.go` — `ParseAruConfig`, `collectPortPlaceholders`, `resolvePlaceholders`, `cloneConfig`; `aruconfig_test.go`. Types: `AruConfig` (tmux as `[]TmuxWindowEntry`, proxy as `[]ProxyConfig`), `TmuxWindowEntry` (name+command+env), `ProxyConfig`. No `ResolvedConfig` or `flattenConfig` — `AruConfig` used directly. |
-| Change worktree behavior | `worktree.go` — `handleWorktreeAdd`, `handleWorktreeDel`, `handleWorktreeOpen`, `handleWorktreeList`, `readConfig`, `runSetupIfNeeded`, `setupProxy`/`removeProxy`; `worktree_test.go`. Tmux config type is `[]TmuxWindowEntry` (ordered slice), not `TmuxConfig` (map). Proxy config is `[]ProxyConfig` (supports multi-proxy). `ResolvedConfig` removed — use `AruConfig.Worktree.*` directly. |
+| Change aru.json config parsing | `aruconfig.go` — `ParseAruConfig`, `collectPortPlaceholders`, `resolvePlaceholders`, `cloneConfig`; `aruconfig_test.go`. Types: `AruConfig` (ramdir as `[]RamDirConfig`, tmux as `[]TmuxWindowEntry`, proxy as `[]ProxyConfig`), `RamDirConfig` (path+size), `TmuxWindowEntry` (name+command+env), `ProxyConfig`. No `ResolvedConfig` or `flattenConfig` — `AruConfig` used directly. |
+| Change worktree behavior | `worktree.go` — `handleWorktreeAdd`, `handleWorktreeDel`, `handleWorktreeOpen`, `handleWorktreeList`, `readConfig`, `runSetupIfNeeded`, `setupProxy`/`removeProxy`; `worktree_test.go`. RAM dir: `mountRamDirEntry`/`unmountRamDirEntry`/`ramDirSubPath`, `mountRamDir(path, size)`, `isTmpfs`, `setupSymlink`/`removeSymlink` (generalized). Tmux config type is `[]TmuxWindowEntry` (ordered slice), not `TmuxConfig` (map). Proxy config is `[]ProxyConfig` (supports multi-proxy). `ResolvedConfig` removed — use `AruConfig.Worktree.*` directly. |
 | Add worktree subcommand | `main.go` — add `"worktree"` case to subcommand switch alongside `"proxy"` |
 | Change HTTP redirect | `redirect.go` — `StartRedirect`; `redirect_test.go` |
 | Add/change routes or middleware | `server.go` — `NewServer` virtual host mux; `server_test.go` |
@@ -71,10 +71,18 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 - Worktrees stored at `~/.aru/wt/<project>/<branch>`
 - RAM-backed data at `~/.aru/ram/<project>/<branch>` with tmpfs via `syscall.Mount` (falls back to regular dir if mount fails)
 - Tmux sessions use custom sockets at `~/.aru/sockets/<project>-<branch>.sock`
-- Config-driven lifecycle via `aru.json` in the worktree root (`worktree.setup`, `worktree.teardown`, `tmux.<name>`, `proxy` sections)
+- Config-driven lifecycle via `aru.json` in the worktree root (`worktree.setup`, `worktree.teardown`, `tmux.<name>`, `proxy`, `ramdir` sections)
 - Placeholder resolution uses **struct-walking** (not marshal-replace-unmarshal): `cloneConfig` → `applyPlaceholders` → `replaceInString`. See `docs/solutions/go-struct-walking-placeholder-resolution.md`.
 - Port persistence at `~/.aru/state/<project>/<branch>/ports.json` (survives reboots, allocated at `add`, reloaded on `open`)
 - Setup idempotency via `setup_oneshot` config field; marker at `~/.aru/state/<project>/<branch>/setup-complete`
+- RAM directory entries (`aru.json` `ramdir` array) replace the old hardcoded single `data` directory. **Breaking change:** no RAM dirs created unless `ramdir` is configured. Each entry gets its own tmpfs mount and worktree symlink.
+- `mountRamDir(path, size)` now takes a `size` parameter (e.g. `"200M"`, `"1G"`). Empty string defaults to `"200M"`. The old hardcoded `"200m"` is removed.
+- `mountRamDirEntry`/`unmountRamDirEntry` manage per-entry RAM lifecycle: create subdirectory, mount tmpfs, create symlink (add); remove symlink, unmount tmpfs, clean up (del).
+- `setupSymlink(target, ramPath, linkName)` generalized from `setupDataSymlink` (now deprecated) — replaces symlinks, skips non-symlink dirs to preserve user data.
+- `removeSymlink(target, linkName)` generalized from `removeDataSymlink` (now deprecated) — only removes symlinks, skips non-symlink paths.
+- Reboot detection via `isTmpfs(path)` using `syscall.Statfs` magic number (`0x01021994`). After reboot the mount point directory persists as an empty ext4 dir; `isTmpfs` correctly returns `false`, triggering re-creation. Safety check: non-empty regular dirs are skipped to preserve fallback data from non-root runs. See `docs/solutions/go-syscall-statfs-tmpfs-detection.md`.
+- In `handleWorktreeDel`, when `resolved` is nil (no aru.json), a fallback scans `~/.aru/ram/<project>/<branch>/` for subdirectories and cleans them up individually using `removeSymlink` + `unmountRamDir`.
+- The base RAM directory `~/.aru/ram/<project>/<branch>/` is created via `os.MkdirAll` (not tmpfs-mounted itself) — only per-entry subdirectories are mounted as tmpfs.
 - `setupTmuxSession` returns errors instead of calling `os.Exit` — callers handle fallback
 - Port discovery scans 1024-9999 via `net.Listen` (TOCTOU accepted — port only used for env var)
 - Missing tmux = hard error; missing git = hard error
@@ -117,6 +125,15 @@ When these code patterns appear in a diff, flag for review:
 - **SIGINT trap missing** — every `buildTmuxCommand` path should include `trap ':' INT` before the env exports and command. Missing trap means Ctrl+C kills the tmux window.
 - **Stale socket removal** — `os.Remove(sock)` moved inside the `has-session` check. If the removal stays unconditional, it may wipe the socket for an existing session.
 - **Select-window after new session** — `select-window -t <session>:0` should run after `createMinimalSession`/`createConfigSession`. Missing this means window index may be arbitrary.
+- **Ramdir iteration vs. old hardcoded data dir** — `handleWorktreeAdd`/`handleWorktreeOpen`/`handleWorktreeDel` must iterate `resolved.RamDir` instead of calling `mountRamDir(ramPath)` + `setupDataSymlink`. Missing the iteration means RAM directories are silently not created (breaking change).
+- **`mountRamDir` signature changed** — now takes `(path, size string)` not `(path string)`. Old callers with single arg will not compile.
+- **`setupDataSymlink`/`removeDataSymlink` are deprecated** — new code should use `setupSymlink(target, ramPath, linkName)` and `removeSymlink(target, linkName)` with an explicit link name. The old wrappers remain for backward compat but should not be used in new code.
+- **`isTmpfs` not called on open** — after adding a new ramdir entry type or behavior, ensure `isTmpfs` is called in `handleWorktreeOpen` to detect reboot. Without it, the path would appear to exist (ext4 mount point) but would not be a tmpfs, causing stale/empty directories.
+- **Safety check skipped before tmpfs remount** — before remounting a path that exists but is not tmpfs, check if it's a non-empty regular directory. Skipping this check can destroy user data from a previous non-root fallback run.
+- **`resolved` is nil in `handleWorktreeDel`** — when no aru.json exists, `resolved` is nil but there may still be ram subdirectories. The fallback `os.ReadDir(baseRam)` scan must handle this case. Missing the fallback means stale RAM dirs leak on `aru worktree del`.
+- **Per-entry parent dirs not created** — `mountRamDirEntry` creates parent directories for the symlink target via `filepath.Dir(linkPath)`. If nested ramdir paths (e.g., `cache/build`) are added, `os.MkdirAll` is required. Missing it causes symlink creation to fail.
+- **`cloneConfig` missing `RamDir` field** — when cloning an `AruConfig`, `RamDir` must be deep-copied via `make([]RamDirConfig, len(...))` + `copy`. A missing `RamDir` in `cloneConfig` means ramdir entries are silently dropped during placeholder resolution.
+- **`RamDir` not added to struct walker** — `collectPortNumbers` and `applyPlaceholders` must traverse `cfg.RamDir[].Path` and `cfg.RamDir[].Size` (strings with placeholders). Missing traversal means placeholders in ramdir entries are never resolved.
 
 ## Pipeline Workflow
 
@@ -136,6 +153,7 @@ Project-specific solutions at `docs/solutions/`:
 - `go-mock-external-commands-testing.md` — Mocking external commands in Go tests using PATH manipulation
 - `go-struct-walking-placeholder-resolution.md` — Go struct-walking placeholder resolution (replaces marshal-replace-unmarshal to avoid JSON injection)
 - `go-port-state-persistence-lifecycle.md` — Go resource-scoped state persistence with lifecycle management (allocate, persist, load, remove, fallback) for per-resource JSON state files
+- `go-syscall-statfs-tmpfs-detection.md` — Detecting tmpfs vs. regular filesystem via `syscall.Statfs` to survive reboots
 
 Global solutions at `~/.pi/agent/docs/solutions/`:
 - `architecture/go-tls-key-permissions.md` — private key 0600 rule

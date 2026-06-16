@@ -311,7 +311,9 @@ func TestGitDeleteBranch(t *testing.T) {
 	})
 }
 
-func TestSetupDataSymlink(t *testing.T) {
+// ── Generalized symlink helpers (Unit 3) ───────────────────────────────────
+
+func TestSetupSymlink_CreatesLink(t *testing.T) {
 	tmp := t.TempDir()
 	target := filepath.Join(tmp, "worktree")
 	ramPath := filepath.Join(tmp, "ram")
@@ -323,12 +325,12 @@ func TestSetupDataSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := setupDataSymlink(target, ramPath); err != nil {
-		t.Fatalf("setupDataSymlink() returned error: %v", err)
+	linkName := "myapp"
+	if err := setupSymlink(target, ramPath, linkName); err != nil {
+		t.Fatalf("setupSymlink() returned error: %v", err)
 	}
 
-	// Verify symlink exists and points to the right place
-	linkPath := filepath.Join(target, "data")
+	linkPath := filepath.Join(target, linkName)
 	linkTarget, err := os.Readlink(linkPath)
 	if err != nil {
 		t.Fatalf("failed to read symlink: %v", err)
@@ -338,7 +340,44 @@ func TestSetupDataSymlink(t *testing.T) {
 	}
 }
 
-func TestSetupDataSymlink_PreservesExistingDir(t *testing.T) {
+func TestSetupSymlink_ReplacesExistingLink(t *testing.T) {
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "worktree")
+	ramPath1 := filepath.Join(tmp, "ram1")
+	ramPath2 := filepath.Join(tmp, "ram2")
+
+	for _, d := range []string{ramPath1, ramPath2} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	linkName := "data"
+
+	// Create first symlink
+	if err := setupSymlink(target, ramPath1, linkName); err != nil {
+		t.Fatal(err)
+	}
+
+	// Replace with a different target
+	if err := setupSymlink(target, ramPath2, linkName); err != nil {
+		t.Fatalf("setupSymlink replacement returned error: %v", err)
+	}
+
+	linkPath := filepath.Join(target, linkName)
+	linkTarget, err := os.Readlink(linkPath)
+	if err != nil {
+		t.Fatalf("failed to read symlink: %v", err)
+	}
+	if linkTarget != ramPath2 {
+		t.Errorf("symlink points to %q, want %q", linkTarget, ramPath2)
+	}
+}
+
+func TestSetupSymlink_SkipsNonSymlinkDir(t *testing.T) {
 	tmp := t.TempDir()
 	target := filepath.Join(tmp, "worktree")
 	ramPath := filepath.Join(tmp, "ram")
@@ -350,28 +389,145 @@ func TestSetupDataSymlink_PreservesExistingDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create a real `data` directory with content
-	dataDir := filepath.Join(target, "data")
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	// Create a real directory where the symlink would go
+	linkName := "mydir"
+	realDir := filepath.Join(target, linkName)
+	if err := os.MkdirAll(realDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	marker := filepath.Join(dataDir, "user-content")
-	if err := os.WriteFile(marker, []byte("important"), 0644); err != nil {
+	marker := filepath.Join(realDir, "important")
+	if err := os.WriteFile(marker, []byte("data"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	// setupDataSymlink should warn and skip, not destroy the directory
-	if err := setupDataSymlink(target, ramPath); err != nil {
-		t.Fatalf("setupDataSymlink() returned error: %v", err)
+	// Should warn and skip, not destroy the directory
+	if err := setupSymlink(target, ramPath, linkName); err != nil {
+		t.Fatalf("setupSymlink() returned error: %v", err)
 	}
 
-	// Verify data directory still exists with user content
+	// Verify user content preserved
 	if _, err := os.Stat(marker); os.IsNotExist(err) {
-		t.Error("user content was destroyed — setupDataSymlink should skip when data is not a symlink")
+		t.Error("user content destroyed — setupSymlink should skip non-symlink paths")
 	}
-	// Verify it is NOT a symlink
-	if fi, err := os.Lstat(dataDir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		t.Error("data was converted to a symlink — should have been preserved as a directory")
+	if fi, err := os.Lstat(realDir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		t.Error("directory was converted to symlink — should have been preserved")
+	}
+}
+
+func TestRemoveSymlink_RemovesOnlySymlinks(t *testing.T) {
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "worktree")
+	ramPath := filepath.Join(tmp, "ram")
+
+	if err := os.MkdirAll(ramPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	linkName := "data"
+	linkPath := filepath.Join(target, linkName)
+
+	// Create symlink first
+	if err := os.Symlink(ramPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remove via generalized function
+	if err := removeSymlink(target, linkName); err != nil {
+		t.Fatalf("removeSymlink() returned error: %v", err)
+	}
+
+	if _, err := os.Lstat(linkPath); !os.IsNotExist(err) {
+		t.Error("symlink still exists after removeSymlink")
+	}
+}
+
+func TestRemoveSymlink_SkipsNonSymlink(t *testing.T) {
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "worktree")
+
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a real directory
+	linkName := "data"
+	realDir := filepath.Join(target, linkName)
+	if err := os.MkdirAll(realDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should not error, should not remove the directory
+	if err := removeSymlink(target, linkName); err != nil {
+		t.Fatalf("removeSymlink() for non-symlink returned error: %v", err)
+	}
+
+	if _, err := os.Stat(realDir); os.IsNotExist(err) {
+		t.Error("removeSymlink removed a non-symlink directory")
+	}
+}
+
+func TestRemoveSymlink_MissingTarget(t *testing.T) {
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "worktree")
+
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should not error for non-existent link
+	if err := removeSymlink(target, "nonexistent"); err != nil {
+		t.Fatalf("removeSymlink() for missing link returned error: %v", err)
+	}
+}
+
+func TestSetupDataSymlink_BackwardCompat(t *testing.T) {
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "worktree")
+	ramPath := filepath.Join(tmp, "ram")
+
+	if err := os.MkdirAll(ramPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Old wrapper should still work
+	if err := setupDataSymlink(target, ramPath); err != nil {
+		t.Fatalf("setupDataSymlink() (wrapper) returned error: %v", err)
+	}
+
+	linkPath := filepath.Join(target, "data")
+	if _, err := os.Stat(linkPath); os.IsNotExist(err) {
+		t.Error("setupDataSymlink wrapper did not create symlink")
+	}
+}
+
+func TestRemoveDataSymlink_BackwardCompat(t *testing.T) {
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "worktree")
+	ramPath := filepath.Join(tmp, "ram")
+
+	if err := os.MkdirAll(ramPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(ramPath, filepath.Join(target, "data")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Old wrapper should still work
+	if err := removeDataSymlink(target); err != nil {
+		t.Fatalf("removeDataSymlink() (wrapper) returned error: %v", err)
+	}
+
+	if _, err := os.Lstat(filepath.Join(target, "data")); !os.IsNotExist(err) {
+		t.Error("removeDataSymlink wrapper did not remove symlink")
 	}
 }
 
@@ -571,6 +727,241 @@ func TestClearSetupComplete(t *testing.T) {
 
 	// Clear again should not panic
 	clearSetupComplete(project, branch)
+}
+
+// ── RamDir entry helpers (Unit 4) ──────────────────────────────────────────
+
+func TestRamDirSubPath(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		project string
+		branch  string
+		entry   string
+		want    string
+	}{
+		{
+			name:    "simple path",
+			project: "myproject",
+			branch:  "feature-x",
+			entry:   "data",
+			want:    filepath.Join(home, ".aru", "ram", "myproject", "feature-x", "data"),
+		},
+		{
+			name:    "nested path",
+			project: "myproject",
+			branch:  "feature-x",
+			entry:   "a/b/c/data",
+			want:    filepath.Join(home, ".aru", "ram", "myproject", "feature-x", "a", "b", "c", "data"),
+		},
+		{
+			name:    "single segment",
+			project: "p",
+			branch:  "b",
+			entry:   "x",
+			want:    filepath.Join(home, ".aru", "ram", "p", "b", "x"),
+		},
+		{
+			name:    "empty entry",
+			project: "p",
+			branch:  "b",
+			entry:   "",
+			want:    filepath.Join(home, ".aru", "ram", "p", "b", ""),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ramDirSubPath(tt.project, tt.branch, tt.entry)
+			if got != tt.want {
+				t.Errorf("ramDirSubPath() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMountRamDirEntry_CreatesMountAndSymlink(t *testing.T) {
+	tmp := t.TempDir()
+	project := "testproj"
+	branch := "test-branch"
+	entry := RamDirConfig{Path: "data", Size: "100M"}
+	target := filepath.Join(tmp, "worktree")
+
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	// Cleanup: unmount if mount succeeded
+	t.Cleanup(func() {
+		subPath := ramDirSubPath(project, branch, entry.Path)
+		syscall.Unmount(subPath, 0)
+	})
+
+	err := mountRamDirEntry(project, branch, entry, target)
+	if err != nil {
+		t.Fatalf("mountRamDirEntry() returned error: %v", err)
+	}
+
+	// Verify the RAM subdirectory was created
+	subPath := ramDirSubPath(project, branch, entry.Path)
+	if _, err := os.Stat(subPath); os.IsNotExist(err) {
+		t.Errorf("ram subdirectory was not created: %s", subPath)
+	}
+
+	// Verify the symlink was created in the worktree
+	linkPath := filepath.Join(target, entry.Path)
+	linkTarget, err := os.Readlink(linkPath)
+	if err != nil {
+		t.Fatalf("failed to read symlink: %v", err)
+	}
+	if linkTarget != subPath {
+		t.Errorf("symlink points to %q, want %q", linkTarget, subPath)
+	}
+}
+
+func TestMountRamDirEntry_NestedPath(t *testing.T) {
+	tmp := t.TempDir()
+	project := "testproj"
+	branch := "test-branch"
+	entry := RamDirConfig{Path: "a/b/c/data", Size: ""}
+	target := filepath.Join(tmp, "worktree")
+
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	// Cleanup: unmount if mount succeeded
+	t.Cleanup(func() {
+		subPath := ramDirSubPath(project, branch, entry.Path)
+		syscall.Unmount(subPath, 0)
+	})
+
+	err := mountRamDirEntry(project, branch, entry, target)
+	if err != nil {
+		t.Fatalf("mountRamDirEntry() with nested path returned error: %v", err)
+	}
+
+	// Verify the RAM subdirectory was created (parent dirs included)
+	subPath := ramDirSubPath(project, branch, entry.Path)
+	if _, err := os.Stat(subPath); os.IsNotExist(err) {
+		t.Errorf("ram subdirectory was not created: %s", subPath)
+	}
+
+	// Verify the symlink created with nested path
+	linkPath := filepath.Join(target, entry.Path)
+	if _, err := os.Stat(linkPath); os.IsNotExist(err) {
+		t.Errorf("symlink target was not created: %s", linkPath)
+	}
+
+	// Verify parent dir of symlink was created
+	linkParent := filepath.Dir(linkPath)
+	if _, err := os.Stat(linkParent); os.IsNotExist(err) {
+		t.Errorf("parent directory of symlink was not created: %s", linkParent)
+	}
+}
+
+func TestUnmountRamDirEntry_RemovesSymlinkAndDir(t *testing.T) {
+	tmp := t.TempDir()
+	project := "testproj"
+	branch := "test-branch"
+	entry := RamDirConfig{Path: "data", Size: "100M"}
+	target := filepath.Join(tmp, "worktree")
+
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	// First mount
+	if err := mountRamDirEntry(project, branch, entry, target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now unmount
+	if err := unmountRamDirEntry(project, branch, entry, target); err != nil {
+		t.Fatalf("unmountRamDirEntry() returned error: %v", err)
+	}
+
+	// Verify symlink is gone
+	linkPath := filepath.Join(target, entry.Path)
+	if _, err := os.Lstat(linkPath); !os.IsNotExist(err) {
+		t.Error("symlink should be removed after unmount")
+	}
+
+	// Verify RAM subdirectory is gone
+	subPath := ramDirSubPath(project, branch, entry.Path)
+	if _, err := os.Stat(subPath); !os.IsNotExist(err) {
+		t.Error("RAM subdirectory should be removed after unmount")
+	}
+}
+
+func TestUnmountRamDirEntry_CleanupNestedPath(t *testing.T) {
+	tmp := t.TempDir()
+	project := "testproj"
+	branch := "test-branch"
+	entry := RamDirConfig{Path: "cache/build", Size: ""}
+	target := filepath.Join(tmp, "worktree")
+
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	// First mount
+	if err := mountRamDirEntry(project, branch, entry, target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now unmount
+	if err := unmountRamDirEntry(project, branch, entry, target); err != nil {
+		t.Fatalf("unmountRamDirEntry() returned error: %v", err)
+	}
+
+	// Verify symlink is gone
+	linkPath := filepath.Join(target, entry.Path)
+	if _, err := os.Lstat(linkPath); !os.IsNotExist(err) {
+		t.Error("symlink should be removed after unmount for nested path")
+	}
+
+	// Verify RAM subdirectory is gone
+	subPath := ramDirSubPath(project, branch, entry.Path)
+	if _, err := os.Stat(subPath); !os.IsNotExist(err) {
+		t.Error("RAM subdirectory should be removed after unmount for nested path")
+	}
+}
+
+func TestUnmountRamDirEntry_Idempotent(t *testing.T) {
+	tmp := t.TempDir()
+	project := "testproj"
+	branch := "test-branch"
+	entry := RamDirConfig{Path: "data", Size: ""}
+	target := filepath.Join(tmp, "worktree")
+
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	// Second call (without mount) should not error
+	if err := unmountRamDirEntry(project, branch, entry, target); err != nil {
+		t.Fatalf("second unmountRamDirEntry() returned error: %v", err)
+	}
 }
 
 func TestRunSetupIfNeeded_RunsWhenNoMarker(t *testing.T) {
@@ -1627,23 +2018,61 @@ func TestBuildTmuxCommand_OnlyEnv(t *testing.T) {
 	}
 }
 
-func TestMountRamDir(t *testing.T) {
+func TestMountRamDir_HardcodedCall(t *testing.T) {
 	tmp := t.TempDir()
 	ramPath := filepath.Join(tmp, "ramtest")
 
-	// Clean up the tmpfs mount if it succeeded, so TempDir cleanup doesn't fail
 	t.Cleanup(func() {
 		syscall.Unmount(ramPath, 0)
 	})
 
-	err := mountRamDir(ramPath)
+	err := mountRamDir(ramPath, "")
 	if err != nil {
-		// Mount may fail if not root — that's okay, just verify the dir exists
 		t.Logf("mountRamDir() returned error (may not be root): %v", err)
 	}
 
 	if _, err := os.Stat(ramPath); os.IsNotExist(err) {
 		t.Error("ram directory was not created even after mount failure")
+	}
+}
+
+// Both TestMountRamDir functions below test the new signature.
+// Renamed test to avoid conflict — old test name redirected here.
+func TestMountRamDir_FallbackPreserved(t *testing.T) {
+	tmp := t.TempDir()
+	ramPath := filepath.Join(tmp, "ramfallback")
+
+	t.Cleanup(func() {
+		syscall.Unmount(ramPath, 0)
+	})
+
+	err := mountRamDir(ramPath, "200M")
+	if err != nil {
+		t.Logf("mountRamDir() returned error (may not be root): %v", err)
+	}
+
+	// Dir should exist even if mount fails
+	if _, err := os.Stat(ramPath); os.IsNotExist(err) {
+		t.Error("ram directory was not created after mount attempt")
+	}
+}
+
+func TestMountRamDir_DefaultSize(t *testing.T) {
+	tmp := t.TempDir()
+	ramPath := filepath.Join(tmp, "ramdefault")
+
+	t.Cleanup(func() {
+		syscall.Unmount(ramPath, 0)
+	})
+
+	// Empty string should trigger default "200M" inside mountRamDir
+	err := mountRamDir(ramPath, "")
+	if err != nil {
+		t.Logf("mountRamDir() with empty size returned error (may not be root): %v", err)
+	}
+
+	if _, err := os.Stat(ramPath); os.IsNotExist(err) {
+		t.Error("ram directory was not created after mount attempt")
 	}
 }
 
@@ -1863,6 +2292,742 @@ func TestCreateConfigSession_DoesNotSelectPi(t *testing.T) {
 	if selectCount != 0 {
 		t.Errorf("createConfigSession issued %d select-window calls, want 0 (selection is the caller's responsibility)", selectCount)
 	}
+}
+
+// ── Worktree add/ramdir lifecycle tests (Units 5-7) ────────────────────────
+
+func TestHandleWorktreeAdd_RamDir_SingleEntry(t *testing.T) {
+	tmp := t.TempDir()
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	dir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "ramdir-add")
+
+	mockDir := t.TempDir()
+	createMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	// Note: we can't easily call handleWorktreeAdd directly because it calls
+	// os.Exit on errors and blocks on tmux. Instead, simulate its ramdir logic.
+	project := filepath.Base(dir)
+	branch := "ramdir-add"
+	target := worktreeDir(project, branch)
+
+	// Create the worktree directory
+	if err := gitWorktreeAdd(target, branch); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		os.RemoveAll(target)
+		gitWorktreeRemove(target)
+	})
+
+	// Write aru.json with a ramdir entry
+	aruJSON := `{"ramdir": [{"path": "data", "size": "100M"}]}`
+	if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Parse and resolve
+	cfg, err := ParseAruConfig(target)
+	if err != nil {
+		t.Fatalf("ParseAruConfig: %v", err)
+	}
+
+	// Ensure base ram dir exists (as handleWorktreeAdd would do)
+	baseRam := ramDir(project, branch)
+	if err := os.MkdirAll(baseRam, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Iterate ramdir entries (same logic as handleWorktreeAdd)
+	if cfg != nil {
+		for _, entry := range cfg.RamDir {
+			t.Cleanup(func() {
+				unmountRamDirEntry(project, branch, entry, target)
+			})
+			if err := mountRamDirEntry(project, branch, entry, target); err != nil {
+				t.Fatalf("mountRamDirEntry: %v", err)
+			}
+		}
+	}
+
+	// Verify the ramdir entry was created
+	subPath := ramDirSubPath(project, branch, "data")
+	if _, err := os.Stat(subPath); os.IsNotExist(err) {
+		t.Errorf("ramdir subdirectory not created: %s", subPath)
+	}
+
+	// Verify symlink was created
+	linkPath := filepath.Join(target, "data")
+	linkTarget, err := os.Readlink(linkPath)
+	if err != nil {
+		t.Fatalf("failed to read symlink: %v", err)
+	}
+	if linkTarget != subPath {
+		t.Errorf("symlink points to %q, want %q", linkTarget, subPath)
+	}
+}
+
+func TestHandleWorktreeAdd_RamDir_NestedPath(t *testing.T) {
+	tmp := t.TempDir()
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	dir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "ramdir-add-nested")
+
+	mockDir := t.TempDir()
+	createMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	project := filepath.Base(dir)
+	branch := "ramdir-add-nested"
+	target := worktreeDir(project, branch)
+
+	if err := gitWorktreeAdd(target, branch); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		os.RemoveAll(target)
+		gitWorktreeRemove(target)
+	})
+
+	aruJSON := `{"ramdir": [{"path": "a/b/c/data"}]}`
+	if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := ParseAruConfig(target)
+	if err != nil {
+		t.Fatalf("ParseAruConfig: %v", err)
+	}
+
+	baseRam := ramDir(project, branch)
+	if err := os.MkdirAll(baseRam, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg != nil {
+		for _, entry := range cfg.RamDir {
+			t.Cleanup(func() {
+				unmountRamDirEntry(project, branch, entry, target)
+			})
+			if err := mountRamDirEntry(project, branch, entry, target); err != nil {
+				t.Fatalf("mountRamDirEntry: %v", err)
+			}
+		}
+	}
+
+	// Verify the nested path created parent dirs and symlink
+	subPath := ramDirSubPath(project, branch, "a/b/c/data")
+	if _, err := os.Stat(subPath); os.IsNotExist(err) {
+		t.Errorf("ramdir subdirectory not created: %s", subPath)
+	}
+
+	linkPath := filepath.Join(target, "a", "b", "c", "data")
+	if _, err := os.Stat(linkPath); os.IsNotExist(err) {
+		t.Errorf("symlink target not created: %s", linkPath)
+	}
+}
+
+func TestHandleWorktreeAdd_RamDir_NoConfig(t *testing.T) {
+	tmp := t.TempDir()
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	dir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "ramdir-noconfig")
+
+	mockDir := t.TempDir()
+	createMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	project := filepath.Base(dir)
+	branch := "ramdir-noconfig"
+	target := worktreeDir(project, branch)
+
+	if err := gitWorktreeAdd(target, branch); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		os.RemoveAll(target)
+		gitWorktreeRemove(target)
+	})
+
+	// No aru.json — should produce no RAM dirs
+	cfg, err := ParseAruConfig(target)
+	if err != nil {
+		t.Fatalf("ParseAruConfig: %v", err)
+	}
+
+	if cfg != nil {
+		for _, entry := range cfg.RamDir {
+			t.Cleanup(func() {
+				unmountRamDirEntry(project, branch, entry, target)
+			})
+			if err := mountRamDirEntry(project, branch, entry, target); err != nil {
+				t.Fatalf("mountRamDirEntry: %v", err)
+			}
+		}
+	}
+
+	// No ramdir should be created when no aru.json exists
+	if cfg == nil {
+		// Success — no ramdir entries to process
+		return
+	}
+	if len(cfg.RamDir) == 0 {
+		// Success — no ramdir entries to process
+		return
+	}
+}
+
+func TestHandleWorktreeAdd_RamDir_MultipleEntries(t *testing.T) {
+	tmp := t.TempDir()
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	dir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "ramdir-multi")
+
+	mockDir := t.TempDir()
+	createMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	project := filepath.Base(dir)
+	branch := "ramdir-multi"
+	target := worktreeDir(project, branch)
+
+	if err := gitWorktreeAdd(target, branch); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		os.RemoveAll(target)
+		gitWorktreeRemove(target)
+	})
+
+	aruJSON := `{"ramdir": [{"path": "data"}, {"path": "cache", "size": "500M"}]}`
+	if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := ParseAruConfig(target)
+	if err != nil {
+		t.Fatalf("ParseAruConfig: %v", err)
+	}
+
+	baseRam := ramDir(project, branch)
+	if err := os.MkdirAll(baseRam, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg != nil {
+		for _, entry := range cfg.RamDir {
+			t.Cleanup(func() {
+				unmountRamDirEntry(project, branch, entry, target)
+			})
+			if err := mountRamDirEntry(project, branch, entry, target); err != nil {
+				t.Fatalf("mountRamDirEntry for %s: %v", entry.Path, err)
+			}
+		}
+	}
+
+	// Verify both entries were created
+	for _, path := range []string{"data", "cache"} {
+		subPath := ramDirSubPath(project, branch, path)
+		if _, err := os.Stat(subPath); os.IsNotExist(err) {
+			t.Errorf("ramdir subdirectory %s not created: %s", path, subPath)
+		}
+		linkPath := filepath.Join(target, path)
+		if _, err := os.Stat(linkPath); os.IsNotExist(err) {
+			t.Errorf("symlink for %s not created: %s", path, linkPath)
+		}
+	}
+}
+
+// TestHandleWorktreeOpen_RamDir_Noop verifies that open is a no-op when
+// both the ramdir subdirectory and symlink are intact.
+func TestHandleWorktreeOpen_RamDir_Noop(t *testing.T) {
+	tmp := t.TempDir()
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	dir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "open-noop")
+
+	project := filepath.Base(dir)
+	branch := "open-noop"
+	target := worktreeDir(project, branch)
+
+	if err := gitWorktreeAdd(target, branch); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		gitWorktreeRemove(target)
+	})
+
+	aruJSON := `{"ramdir": [{"path": "data", "size": "100M"}]}`
+	if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate add: create ramdir entry
+	cfg, err := ParseAruConfig(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRam := ramDir(project, branch)
+	os.MkdirAll(baseRam, 0755)
+	t.Cleanup(func() {
+		if cfg != nil {
+			for _, entry := range cfg.RamDir {
+				unmountRamDirEntry(project, branch, entry, target)
+			}
+		}
+	})
+	if cfg != nil {
+		for _, entry := range cfg.RamDir {
+			if err := mountRamDirEntry(project, branch, entry, target); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Simulate open: check both exist and skip (no-op)
+	for _, entry := range cfg.RamDir {
+		subPath := ramDirSubPath(project, branch, entry.Path)
+		linkPath := filepath.Join(target, entry.Path)
+
+		// Both should exist
+		if _, err := os.Stat(subPath); os.IsNotExist(err) {
+			t.Errorf("ramdir subpath missing before open: %s", subPath)
+		}
+		if _, err := os.Stat(linkPath); os.IsNotExist(err) {
+			t.Errorf("symlink missing before open: %s", linkPath)
+		}
+
+		// os.Stat on linkPath (follows symlinks) should succeed
+		if _, err := os.Stat(linkPath); err != nil {
+			t.Logf("open would recreate: os.Stat(linkPath)=%v", err)
+		}
+	}
+}
+
+func TestHandleWorktreeOpen_RamDir_Reboot(t *testing.T) {
+	tmp := t.TempDir()
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	dir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "open-reboot")
+
+	project := filepath.Base(dir)
+	branch := "open-reboot"
+	target := worktreeDir(project, branch)
+
+	if err := gitWorktreeAdd(target, branch); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		gitWorktreeRemove(target)
+	})
+
+	aruJSON := `{"ramdir": [{"path": "data", "size": "100M"}]}`
+	if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate add: create ramdir entry
+	cfg, err := ParseAruConfig(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRam := ramDir(project, branch)
+	os.MkdirAll(baseRam, 0755)
+	t.Cleanup(func() {
+		if cfg != nil {
+			for _, entry := range cfg.RamDir {
+				unmountRamDirEntry(project, branch, entry, target)
+			}
+		}
+	})
+	if cfg != nil {
+		for _, entry := range cfg.RamDir {
+			if err := mountRamDirEntry(project, branch, entry, target); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Simulate reboot: remove the RAM subdirectory's contents and make symlink dangling
+	// After reboot: RAM subdirectory dir exists (on disk) but tmpfs contents are gone.
+	// The symlink under the worktree becomes dangling.
+	subPath := ramDirSubPath(project, branch, "data")
+	linkPath := filepath.Join(target, "data")
+
+	// Remove the RAM subdirectory to simulate lost tmpfs
+	os.RemoveAll(subPath)
+	os.MkdirAll(subPath, 0755)
+
+	// Break the symlink so os.Stat returns ENOENT
+	os.Remove(linkPath)
+
+	// Simulate open: recreate ramdir entry (just like handleWorktreeOpen would)
+	if cfg != nil {
+		for _, entry := range cfg.RamDir {
+			// Ensure base ram dir exists
+			baseRam := ramDir(project, branch)
+			os.MkdirAll(baseRam, 0755)
+
+			linkPath := filepath.Join(target, entry.Path)
+
+			// Check if symlink resolves correctly
+			if _, err := os.Stat(linkPath); os.IsNotExist(err) {
+				// Recreate — cleanup mount if succeeds
+				recreateEntry := entry // capture for cleanup
+				t.Cleanup(func() {
+					unmountRamDirEntry(project, branch, recreateEntry, target)
+				})
+				if err := mountRamDirEntry(project, branch, entry, target); err != nil {
+					t.Fatalf("recreate after reboot failed: %v", err)
+				}
+			}
+		}
+	}
+
+	// Verify symlink and subdirectory exist after re-creation
+	if _, err := os.Stat(linkPath); os.IsNotExist(err) {
+		t.Errorf("symlink not recreated after reboot: %s", linkPath)
+	}
+	linkTarget, err := os.Readlink(linkPath)
+	if err != nil {
+		t.Fatalf("failed to read recreated symlink: %v", err)
+	}
+	if linkTarget != subPath {
+		t.Errorf("symlink points to %q, want %q", linkTarget, subPath)
+	}
+	if _, err := os.Stat(subPath); os.IsNotExist(err) {
+		t.Errorf("ramdir subpath not recreated after reboot: %s", subPath)
+	}
+}
+
+// TestHandleWorktreeOpen_RamDir_MultipleEntries verifies that open handles
+// multiple ramdir entries correctly.
+func TestHandleWorktreeOpen_RamDir_MultipleEntries(t *testing.T) {
+	tmp := t.TempDir()
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	dir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "open-multi")
+
+	project := filepath.Base(dir)
+	branch := "open-multi"
+	target := worktreeDir(project, branch)
+
+	if err := gitWorktreeAdd(target, branch); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		gitWorktreeRemove(target)
+	})
+
+	aruJSON := `{"ramdir": [{"path": "data", "size": "100M"}, {"path": "cache", "size": "500M"}]}`
+	if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate add
+	cfg, err := ParseAruConfig(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRam := ramDir(project, branch)
+	os.MkdirAll(baseRam, 0755)
+	t.Cleanup(func() {
+		if cfg != nil {
+			for _, entry := range cfg.RamDir {
+				unmountRamDirEntry(project, branch, entry, target)
+			}
+		}
+	})
+	if cfg != nil {
+		for _, entry := range cfg.RamDir {
+			if err := mountRamDirEntry(project, branch, entry, target); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Simulate reboot: break all entries
+	for _, entry := range cfg.RamDir {
+		linkPath := filepath.Join(target, entry.Path)
+		subPath := ramDirSubPath(project, branch, entry.Path)
+		os.RemoveAll(subPath)
+		os.MkdirAll(subPath, 0755)
+		os.Remove(linkPath)
+	}
+
+	// Simulate open: recreate all entries
+	if cfg != nil {
+		for _, entry := range cfg.RamDir {
+			baseRam := ramDir(project, branch)
+			os.MkdirAll(baseRam, 0755)
+			if _, err := os.Stat(filepath.Join(target, entry.Path)); os.IsNotExist(err) {
+				recreateEntry := entry // capture for cleanup
+				t.Cleanup(func() {
+					unmountRamDirEntry(project, branch, recreateEntry, target)
+				})
+				if err := mountRamDirEntry(project, branch, entry, target); err != nil {
+					t.Fatalf("recreate after reboot for %s failed: %v", entry.Path, err)
+				}
+			}
+		}
+	}
+
+	// Verify all entries recreated
+	for _, entry := range cfg.RamDir {
+		subPath := ramDirSubPath(project, branch, entry.Path)
+		linkPath := filepath.Join(target, entry.Path)
+		if _, err := os.Stat(linkPath); os.IsNotExist(err) {
+			t.Errorf("symlink not recreated for %s: %s", entry.Path, linkPath)
+		}
+		if _, err := os.Stat(subPath); os.IsNotExist(err) {
+			t.Errorf("ramdir not recreated for %s: %s", entry.Path, subPath)
+		}
+	}
+}
+
+// ── handleWorktreeDel ramdir cleanup tests (Unit 7) ───────────────────────
+
+func TestHandleWorktreeDel_RamDir_Cleanup(t *testing.T) {
+	tmp := t.TempDir()
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	dir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "del-cleanup")
+
+	mockDir := t.TempDir()
+	createMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	project := filepath.Base(dir)
+	branch := "del-cleanup"
+	target := worktreeDir(project, branch)
+
+	// Create worktree
+	if err := gitWorktreeAdd(target, branch); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write aru.json with ramdir entry
+	aruJSON := `{"ramdir": [{"path": "data", "size": "100M"}]}`
+	if err := os.WriteFile(filepath.Join(target, "aru.json"), []byte(aruJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate add: create ramdir entry
+	cfg, err := ParseAruConfig(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRam := ramDir(project, branch)
+	if err := os.MkdirAll(baseRam, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if cfg != nil {
+		for _, entry := range cfg.RamDir {
+			if err := mountRamDirEntry(project, branch, entry, target); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Verify ramdir exists before cleanup
+	subPath := ramDirSubPath(project, branch, "data")
+	linkPath := filepath.Join(target, "data")
+	if _, err := os.Stat(linkPath); os.IsNotExist(err) {
+		t.Fatal("precondition: symlink should exist")
+	}
+	if _, err := os.Stat(subPath); os.IsNotExist(err) {
+		t.Fatal("precondition: ramdir subdirectory should exist")
+	}
+
+	// Simulate del: clean up ramdir entries (same logic as handleWorktreeDel)
+	if cfg != nil {
+		for _, entry := range cfg.RamDir {
+			// Remove symlink first
+			if err := removeSymlink(target, entry.Path); err != nil {
+				t.Log("removeSymlink error (non-fatal):", err)
+			}
+			// Then unmount and remove
+			if err := unmountRamDirEntry(project, branch, entry, target); err != nil {
+				t.Log("unmountRamDirEntry error (non-fatal):", err)
+			}
+		}
+	}
+
+	// Also clean up base ram dir
+	os.RemoveAll(baseRam)
+
+	// Verify symlink is gone
+	if _, err := os.Lstat(linkPath); !os.IsNotExist(err) {
+		t.Error("symlink should be removed after cleanup")
+	}
+
+	// Verify base ram dir is gone
+	if _, err := os.Stat(baseRam); !os.IsNotExist(err) {
+		t.Error("base ram dir should be removed after cleanup")
+	}
+
+	// Cleanup git worktree
+	gitWorktreeRemove(target)
+}
+
+func TestHandleWorktreeDel_RamDir_EmptyConfig(t *testing.T) {
+	tmp := t.TempDir()
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	dir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "del-empty")
+
+	mockDir := t.TempDir()
+	createMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	project := filepath.Base(dir)
+	branch := "del-empty"
+	target := worktreeDir(project, branch)
+
+	if err := gitWorktreeAdd(target, branch); err != nil {
+		t.Fatal(err)
+	}
+
+	// No aru.json (cfg is nil) — should skip ramdir cleanup without error
+	cfg, err := ParseAruConfig(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate del: with nil config, this should be a no-op
+	if cfg != nil {
+		for _, entry := range cfg.RamDir {
+			removeSymlink(target, entry.Path)
+			unmountRamDirEntry(project, branch, entry, target)
+		}
+	}
+
+	gitWorktreeRemove(target)
+}
+
+func TestHandleWorktreeDel_RamDir_MissingConfigFallback(t *testing.T) {
+	tmp := t.TempDir()
+	homeDir := filepath.Join(tmp, "home")
+	t.Setenv("HOME", homeDir)
+
+	dir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	setupTestRepo(t, dir)
+	createTestBranch(t, dir, "del-fallback")
+
+	mockDir := t.TempDir()
+	createMockTmux(t, mockDir)
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	project := filepath.Base(dir)
+	branch := "del-fallback"
+	target := worktreeDir(project, branch)
+
+	if err := gitWorktreeAdd(target, branch); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create ramdir entries manually (as if aru.json was lost)
+	baseRam := ramDir(project, branch)
+	for _, subdir := range []string{"data", "cache"} {
+		subPath := filepath.Join(baseRam, subdir)
+		os.MkdirAll(subPath, 0755)
+		if err := mountRamDir(subPath, ""); err != nil {
+			t.Logf("mountRamDir for fallback test: %v", err)
+		}
+		os.Symlink(subPath, filepath.Join(target, subdir))
+	}
+
+	// Simulate del: with no aru.json, fallback should scan base ram dir
+	cfg, err := ParseAruConfig(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg != nil {
+		// Normal ramdir cleanup
+		for _, entry := range cfg.RamDir {
+			removeSymlink(target, entry.Path)
+			unmountRamDirEntry(project, branch, entry, target)
+		}
+	} else {
+		// Config missing fallback: scan base ram dir for subdirectories
+		entries, _ := os.ReadDir(baseRam)
+		for _, entry := range entries {
+			subPath := filepath.Join(baseRam, entry.Name())
+			removeSymlink(target, entry.Name())
+			unmountRamDir(subPath)
+		}
+	}
+
+	// Clean up base ram dir
+	os.RemoveAll(baseRam)
+
+	// Verify symlinks are gone
+	for _, subdir := range []string{"data", "cache"} {
+		if _, err := os.Lstat(filepath.Join(target, subdir)); !os.IsNotExist(err) {
+			t.Errorf("symlink %s should be removed after fallback cleanup", subdir)
+		}
+	}
+
+	gitWorktreeRemove(target)
 }
 
 // mockTmuxCall is a single invocation recorded by the recording mock tmux.

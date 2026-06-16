@@ -583,6 +583,150 @@ func TestResolvePlaceholders_DoesNotMutateOriginal(t *testing.T) {
 	}
 }
 
+// ── RamDirConfig tests ────────────────────────────────────────────────────
+
+func TestParseAruConfig_RamDir_SingleEntry(t *testing.T) {
+	dir := t.TempDir()
+	jsonContent := `{
+		"ramdir": [{"path": "data", "size": "100M"}]
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "aru.json"), []byte(jsonContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := ParseAruConfig(dir)
+	if err != nil {
+		t.Fatalf("ParseAruConfig() returned error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("ParseAruConfig() returned nil")
+	}
+
+	if len(cfg.RamDir) != 1 {
+		t.Fatalf("RamDir has %d entries, want 1", len(cfg.RamDir))
+	}
+	if cfg.RamDir[0].Path != "data" {
+		t.Errorf("RamDir[0].Path = %q, want 'data'", cfg.RamDir[0].Path)
+	}
+	if cfg.RamDir[0].Size != "100M" {
+		t.Errorf("RamDir[0].Size = %q, want '100M'", cfg.RamDir[0].Size)
+	}
+}
+
+func TestParseAruConfig_RamDir_MultipleEntries(t *testing.T) {
+	dir := t.TempDir()
+	jsonContent := `{
+		"ramdir": [
+			{"path": "data", "size": "100M"},
+			{"path": "cache/build", "size": "500M"},
+			{"path": "logs"}
+		]
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "aru.json"), []byte(jsonContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := ParseAruConfig(dir)
+	if err != nil {
+		t.Fatalf("ParseAruConfig() returned error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("ParseAruConfig() returned nil")
+	}
+
+	if len(cfg.RamDir) != 3 {
+		t.Fatalf("RamDir has %d entries, want 3", len(cfg.RamDir))
+	}
+	if cfg.RamDir[0].Path != "data" || cfg.RamDir[0].Size != "100M" {
+		t.Errorf("RamDir[0] = %+v, want {Path: data, Size: 100M}", cfg.RamDir[0])
+	}
+	if cfg.RamDir[1].Path != "cache/build" || cfg.RamDir[1].Size != "500M" {
+		t.Errorf("RamDir[1] = %+v, want {Path: cache/build, Size: 500M}", cfg.RamDir[1])
+	}
+	if cfg.RamDir[2].Path != "logs" || cfg.RamDir[2].Size != "" {
+		t.Errorf("RamDir[2] = %+v, want {Path: logs, Size: ''}", cfg.RamDir[2])
+	}
+}
+
+func TestParseAruConfig_RamDir_Absent(t *testing.T) {
+	dir := t.TempDir()
+	jsonContent := `{"worktree": {"setup": ["echo hello"]}}`
+	if err := os.WriteFile(filepath.Join(dir, "aru.json"), []byte(jsonContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := ParseAruConfig(dir)
+	if err != nil {
+		t.Fatalf("ParseAruConfig() returned error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("ParseAruConfig() returned nil")
+	}
+
+	if cfg.RamDir != nil {
+		t.Errorf("RamDir should be nil when key is absent, got %+v", cfg.RamDir)
+	}
+}
+
+func TestCloneConfig_PreservesRamDir(t *testing.T) {
+	original := &AruConfig{
+		RamDir: []RamDirConfig{
+			{Path: "data", Size: "100M"},
+			{Path: "cache", Size: "500M"},
+		},
+	}
+
+	clone := cloneConfig(original)
+	if clone == nil {
+		t.Fatal("cloneConfig returned nil")
+	}
+
+	if len(clone.RamDir) != 2 {
+		t.Fatalf("cloneConfig.RamDir has %d entries, want 2", len(clone.RamDir))
+	}
+	if clone.RamDir[0].Path != "data" || clone.RamDir[0].Size != "100M" {
+		t.Errorf("RamDir[0] = %+v, want {Path: data, Size: 100M}", clone.RamDir[0])
+	}
+	if clone.RamDir[1].Path != "cache" || clone.RamDir[1].Size != "500M" {
+		t.Errorf("RamDir[1] = %+v, want {Path: cache, Size: 500M}", clone.RamDir[1])
+	}
+
+	// Verify mutation isolation: modifying clone should not affect original
+	clone.RamDir[0].Size = "200M"
+	if original.RamDir[0].Size != "100M" {
+		t.Error("cloneConfig mutation affected original — not a deep copy")
+	}
+}
+
+func TestCloneConfig_RamDir_Nil(t *testing.T) {
+	original := &AruConfig{}
+
+	clone := cloneConfig(original)
+	if clone == nil {
+		t.Fatal("cloneConfig returned nil")
+	}
+
+	if clone.RamDir != nil {
+		t.Errorf("cloneConfig.RamDir should be nil when original is nil, got %+v", clone.RamDir)
+	}
+}
+
+func TestRamDirNotCollected(t *testing.T) {
+	cfg := &AruConfig{
+		RamDir: []RamDirConfig{
+			{Path: "<PORT1>", Size: "<PORT2>"},
+		},
+		Tmux: []TmuxWindowEntry{
+			{Command: "echo <PORT1>"},
+		},
+	}
+
+	nums := collectPortPlaceholders(cfg)
+	if len(nums) != 1 || nums[0] != "1" {
+		t.Errorf("collectPortPlaceholders = %v, want [\"1\"] — RamDir placeholders should not be collected", nums)
+	}
+}
+
 // TestCloneConfig_PreservesAllFields is a regression test for a bug where
 // cloneConfig forgot to copy SetupOneshot, causing setup_oneshot=true to be
 // silently dropped during placeholder resolution.

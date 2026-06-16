@@ -18,6 +18,7 @@ type AruConfig struct {
 	Version  int               `json:"version,omitempty"`
 	Worktree *WorktreeConfig   `json:"worktree,omitempty"`
 	Tmux     []TmuxWindowEntry `json:"tmux,omitempty"`
+	RamDir   []RamDirConfig    `json:"ramdir,omitempty"`
 	Proxy    []ProxyConfig     `json:"proxy,omitempty"`
 }
 
@@ -39,6 +40,12 @@ type TmuxWindowEntry struct {
 type TmuxWindow struct {
 	Command string            `json:"command"`
 	Env     map[string]string `json:"env,omitempty"`
+}
+
+// RamDirConfig defines a RAM directory entry.
+type RamDirConfig struct {
+	Path string `json:"path"`
+	Size string `json:"size,omitempty"` // e.g. "200M", "1G" — defaults to "200M" when empty
 }
 
 // ProxyConfig defines a reverse proxy registration.
@@ -289,6 +296,11 @@ func cloneConfig(cfg *AruConfig) *AruConfig {
 			}
 			clone.Tmux[i] = newEntry
 		}
+	}
+
+	if cfg.RamDir != nil {
+		clone.RamDir = make([]RamDirConfig, len(cfg.RamDir))
+		copy(clone.RamDir, cfg.RamDir)
 	}
 
 	if cfg.Proxy != nil {

@@ -88,13 +88,13 @@ aru worktree list
 ```
 
 - Worktrees stored at `~/.aru/wt/<project>/<branch>`
-- RAM-backed data at `~/.aru/ram/<project>/<branch>` (tmpfs via `syscall.Mount`)
-- Data directory symlinked to `<worktree>/data` → RAM directory
+- RAM-backed data at `~/.aru/ram/<project>/<branch>` (tmpfs via `syscall.Mount`), with per-entry subdirectories configured via `aru.json` `ramdir` — each entry gets its own tmpfs mount and a symlink at the configured worktree-relative path
+- Symlinks created for each `ramdir` entry (e.g., `<worktree>/data` → `~/.aru/ram/<project>/<branch>/data`)
 - Tmux sessions managed via custom sockets at `~/.aru/sockets/<project>-<branch>.sock`
 - **Config-driven lifecycle via `aru.json`**: declaratively specify setup commands, teardown commands, tmux windows, and reverse proxy registration — see [aru.json schema](#🔐-trust-model-for-arujson-commands) below
 - Port persistence: allocated ports survive reboots via `~/.aru/state/<project>/<branch>/ports.json`
 - Setup idempotency: `setup_oneshot: true` runs setup only once per worktree session (marker at `~/.aru/state/<project>/<branch>/setup-complete`)
-- RAM directory and symlink auto-recreated on `open` if missing (handle reboots)
+- RAM directory entries auto-recreated on `open` using `syscall.Statfs` to detect reboot (distinguishes tmpfs from leftover ext4 mount-point directories; skips non-empty fallback dirs to preserve user data)
 - Setup and teardown commands run verbatim via `bash -c` (see trust model below)
 
 #### 🔐 Trust model for `aru.json` commands
@@ -138,6 +138,10 @@ Because you already have full shell access, the commands in `aru.json` provide n
   "proxy": [
     { "name": "<BRANCH>.<PROJECT>", "port": "<PORT1>" },
     { "name": "api",                "port": "<PORT2>" }
+  ],
+  "ramdir": [
+    { "path": "data",       "size": "200M" },
+    { "path": "cache/build", "size": "500M" }
   ]
 }
 ```
@@ -153,6 +157,11 @@ Because you already have full shell access, the commands in `aru.json` provide n
 - `proxy` — **array** of reverse proxy registrations (supports multiple proxies). Each entry has:
   - `name` — proxy name with `<PROJECT>`/`<BRANCH>` placeholders for dynamic naming. Can contain dots for multi-level subdomains (e.g., `api.myapp.test`).
   - `port` — port with `<PORT1>`/`<PORT2>`/... placeholders (allocated from 1024-9999)
+- `ramdir` — **array** of RAM-backed tmpfs directory entries. Each entry has:
+  - `path` — worktree-relative path for the symlink (e.g., `"data"`, `"cache/build"`). Parent directories are created automatically.
+  - `size` — optional tmpfs size specifier (e.g., `"200M"`, `"1G"`). Defaults to `"200M"` when omitted.
+
+  > **⚠️ Breaking change:** Previously, every worktree automatically got a `data` directory with a hardcoded 200M tmpfs mount. With the `ramdir` config, no RAM directories are created unless you explicitly add a `ramdir` entry. To restore the old default behavior, add `"ramdir": [{"path": "data"}]` to your `aru.json`.
 
 **SIGINT behavior:** Tmux commands get a `trap ':' INT` handler so the outer shell survives Ctrl+C and drops into a fallback bash shell. Child processes remain interruptible (default SIG_DFL disposition). This prevents accidentally closing the entire tmux window when pressing Ctrl+C on a dev server.
 

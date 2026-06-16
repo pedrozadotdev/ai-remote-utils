@@ -278,22 +278,87 @@ func gitPrune() {
 	cmd.Run()
 }
 
+// ── RAM directory entry helpers ──────────────────────────────────────────
+
+// ramDirSubPath returns the per-entry RAM directory path:
+// ~/.aru/ram/<project>/<branch>/<entryPath>.
+func ramDirSubPath(project, branch, entryPath string) string {
+	return filepath.Join(ramDir(project, branch), entryPath)
+}
+
+// mountRamDirEntry creates and mounts a RAM directory for a single ramdir entry.
+// It creates the RAM subdirectory, mounts tmpfs, creates parent dirs for the
+// symlink target path, and creates the symlink in the worktree.
+func mountRamDirEntry(project, branch string, entry RamDirConfig, target string) error {
+	// Compute the RAM subdirectory path
+	subPath := ramDirSubPath(project, branch, entry.Path)
+
+	// Create the RAM subdirectory
+	if err := os.MkdirAll(subPath, 0755); err != nil {
+		return fmt.Errorf("worktree: failed to create ramdir subdirectory %s: %w", subPath, err)
+	}
+
+	// Mount tmpfs at the subdirectory
+	if err := mountRamDir(subPath, entry.Size); err != nil {
+		// mountRamDir already logs warnings and falls back — don't double-wrap
+		return fmt.Errorf("worktree: failed to mount ramdir entry %s: %w", subPath, err)
+	}
+
+	// Create parent directories for the symlink target (supports nested paths)
+	linkPath := filepath.Join(target, entry.Path)
+	linkParent := filepath.Dir(linkPath)
+	if err := os.MkdirAll(linkParent, 0755); err != nil {
+		return fmt.Errorf("worktree: failed to create symlink parent dirs %s: %w", linkParent, err)
+	}
+
+	// Create the symlink in the worktree
+	if err := setupSymlink(target, subPath, entry.Path); err != nil {
+		return fmt.Errorf("worktree: failed to create symlink for ramdir entry %s: %w", entry.Path, err)
+	}
+
+	return nil
+}
+
+// unmountRamDirEntry removes the symlink and RAM directory for a single ramdir
+// entry. It removes the symlink first, then unmounts and removes the RAM
+// subdirectory. Best-effort: continues on partial failure.
+func unmountRamDirEntry(project, branch string, entry RamDirConfig, target string) error {
+	// Remove symlink first (best-effort)
+	if err := removeSymlink(target, entry.Path); err != nil {
+		slog.Warn("failed to remove symlink for ramdir entry", "path", entry.Path, "error", err)
+	}
+
+	// Unmount and remove the RAM subdirectory
+	subPath := ramDirSubPath(project, branch, entry.Path)
+	if err := unmountRamDir(subPath); err != nil {
+		return fmt.Errorf("worktree: failed to clean up ramdir entry %s: %w", entry.Path, err)
+	}
+
+	return nil
+}
+
 // ── RAM directory management ─────────────────────────────────────────────
 
 // mountRamDir creates a directory and mounts tmpfs at the given path.
 // If tmpfs mount fails (e.g. not root), it falls back to a regular directory.
-func mountRamDir(path string) error {
+// size accepts a tmpfs size specifier (e.g. "200M", "1G"). If empty, defaults to "200M".
+func mountRamDir(path, size string) error {
+	if size == "" {
+		size = "200M"
+	}
+
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return fmt.Errorf("worktree: failed to create RAM directory %s: %w", path, err)
 	}
 
-	if err := syscall.Mount("tmpfs", path, "tmpfs", 0, "size=200m"); err != nil {
-		slog.Warn("failed to mount tmpfs, using regular directory", "path", path, "error", err)
+	mountOpts := "size=" + size
+	if err := syscall.Mount("tmpfs", path, "tmpfs", 0, mountOpts); err != nil {
+		slog.Warn("failed to mount tmpfs, using regular directory", "path", path, "error", err, "size", size)
 		// The directory exists already — fallback to regular dir
 		return nil
 	}
 
-	slog.Info("tmpfs mounted", "path", path, "size", "200m")
+	slog.Info("tmpfs mounted", "path", path, "size", size)
 	return nil
 }
 
@@ -309,18 +374,18 @@ func unmountRamDir(path string) error {
 	return nil
 }
 
-// setupDataSymlink creates a symlink at <target>/data pointing to ramPath.
-// If a symlink already exists, it is replaced. If <target>/data exists as a
-// non-symlink (e.g., a real directory with user content), the function logs
-// a warning and skips symlink creation to avoid destroying user data.
-func setupDataSymlink(target, ramPath string) error {
-	linkPath := filepath.Join(target, "data")
+// setupSymlink creates a symlink at <target>/<linkName> pointing to ramPath.
+// If a symlink already exists at that path, it is replaced. If the path exists
+// as a non-symlink (e.g., a real directory with user content), the function
+// logs a warning and skips symlink creation to avoid destroying user data.
+func setupSymlink(target, ramPath, linkName string) error {
+	linkPath := filepath.Join(target, linkName)
 
 	// Check what's there before touching it
 	if fi, err := os.Lstat(linkPath); err == nil {
 		if fi.Mode()&os.ModeSymlink == 0 {
 			// Existing path is a real directory or file — don't destroy user data
-			slog.Warn("data path exists and is not a symlink; skipping symlink creation to preserve contents", "path", linkPath)
+			slog.Warn("path exists and is not a symlink; skipping symlink creation to preserve contents", "path", linkPath)
 			return nil
 		}
 		// Existing symlink — remove it before recreating
@@ -330,15 +395,16 @@ func setupDataSymlink(target, ramPath string) error {
 	}
 
 	if err := os.Symlink(ramPath, linkPath); err != nil {
-		return fmt.Errorf("worktree: failed to create data symlink: %w", err)
+		return fmt.Errorf("worktree: failed to create symlink %s: %w", linkPath, err)
 	}
 
 	return nil
 }
 
-// removeDataSymlink removes the data symlink at the worktree target.
-func removeDataSymlink(target string) error {
-	linkPath := filepath.Join(target, "data")
+// removeSymlink removes the symlink at <target>/<linkName> if it exists.
+// If the path does not exist or is not a symlink, it is a no-op.
+func removeSymlink(target, linkName string) error {
+	linkPath := filepath.Join(target, linkName)
 
 	// Check if it's a symlink
 	if fi, err := os.Lstat(linkPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
@@ -347,6 +413,29 @@ func removeDataSymlink(target string) error {
 		}
 	}
 	return nil
+}
+
+// setupDataSymlink creates a symlink at <target>/data pointing to ramPath.
+// Deprecated: use setupSymlink(target, ramPath, "data") instead.
+func setupDataSymlink(target, ramPath string) error {
+	return setupSymlink(target, ramPath, "data")
+}
+
+// removeDataSymlink removes the data symlink at the worktree target.
+// Deprecated: use removeSymlink(target, "data") instead.
+func removeDataSymlink(target string) error {
+	return removeSymlink(target, "data")
+}
+
+// isTmpfs checks if the given path resides on a tmpfs filesystem.
+// Uses syscall.Statfs to compare the filesystem type magic number.
+func isTmpfs(path string) bool {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return false
+	}
+	// TMPFS_MAGIC = 0x01021994
+	return stat.Type == 0x01021994
 }
 
 // ── Config-based lifecycle helpers ───────────────────────────────────────
@@ -929,19 +1018,24 @@ func handleWorktreeAdd(branch string) {
 		os.Exit(1)
 	}
 
-	// Mount RAM directory
-	ramPath := ramDir(projectName, branch)
-	if err := mountRamDir(ramPath); err != nil {
-		slog.Warn("failed to set up RAM directory", "path", ramPath, "error", err)
-	}
-
-	// Create data symlink
-	if err := setupDataSymlink(target, ramPath); err != nil {
-		slog.Warn("failed to create data symlink", "error", err)
-	}
-
 	// Read aru.json config and resolve placeholders
 	resolved := readAndResolveConfig(target, projectName, branch)
+
+	// Ensure base RAM directory exists (parent dir for ramdir entries)
+	baseRam := ramDir(projectName, branch)
+	os.MkdirAll(baseRam, 0755)
+
+	// Create RAM directory entries from config (if any)
+	// Old behavior: always mounted a single "data" dir.
+	// New behavior: ramdir entries are defined in aru.json.
+	// If no ramdir config is present, no RAM directories are created.
+	if resolved != nil {
+		for _, entry := range resolved.RamDir {
+			if err := mountRamDirEntry(projectName, branch, entry, target); err != nil {
+				slog.Warn("failed to set up RAM directory entry", "path", entry.Path, "error", err)
+			}
+		}
+	}
 
 	// Run setup commands if config provides them (respects setup_oneshot)
 	runSetupIfNeeded(projectName, branch, target, resolved)
@@ -1019,16 +1113,30 @@ func handleWorktreeDel(branch string) {
 		}
 	}
 
-	// Remove data symlink
-	if err := removeDataSymlink(target); err != nil {
-		slog.Warn("failed to remove data symlink", "error", err)
+	// Clean up RAM directory entries (best-effort)
+	if resolved != nil && len(resolved.RamDir) > 0 {
+		// Iterate over configured ramdir entries
+		for _, entry := range resolved.RamDir {
+			if err := unmountRamDirEntry(projectName, branch, entry, target); err != nil {
+				slog.Warn("failed to clean up ramdir entry", "path", entry.Path, "error", err)
+			}
+		}
+	} else if resolved == nil {
+		// Config missing (no aru.json) — fallback: scan base ram dir for subdirectories
+		baseRam := ramDir(projectName, branch)
+		if entries, err := os.ReadDir(baseRam); err == nil {
+			for _, entry := range entries {
+				subPath := filepath.Join(baseRam, entry.Name())
+				removeSymlink(target, entry.Name())
+				if err := unmountRamDir(subPath); err != nil {
+					slog.Warn("failed to clean up ramdir via fallback", "path", subPath, "error", err)
+				}
+			}
+		}
 	}
 
-	// Unmount and remove RAM directory
-	ramPath := ramDir(projectName, branch)
-	if err := unmountRamDir(ramPath); err != nil {
-		slog.Warn("failed to clean up RAM directory", "path", ramPath, "error", err)
-	}
+	// Remove base RAM directory (expected empty, best-effort)
+	os.RemoveAll(ramDir(projectName, branch))
 
 	// Kill tmux session
 	sock := socketPath(projectName, branch)
@@ -1082,26 +1190,49 @@ func handleWorktreeOpen(branch string) {
 		os.Exit(1)
 	}
 
-	// Re-create RAM dir and symlink if missing (handles reboot)
-	ramPath := ramDir(projectName, branch)
-	if _, err := os.Stat(ramPath); os.IsNotExist(err) {
-		slog.Info("RAM directory missing, re-creating", "path", ramPath)
-		if err := mountRamDir(ramPath); err != nil {
-			slog.Warn("failed to re-create RAM directory", "error", err)
-		}
-	}
-
-	dataPath := filepath.Join(target, "data")
-	if _, err := os.Lstat(dataPath); os.IsNotExist(err) {
-		slog.Info("data symlink missing, re-creating")
-		if err := setupDataSymlink(target, ramPath); err != nil {
-			slog.Warn("failed to re-create data symlink", "error", err)
-		}
-	}
-
 	// Read aru.json config; load original port assignments from state so the
 	// proxy and tmux env vars stay consistent with the original `aru worktree add`.
 	resolved := readAndResolveConfigOpen(target, projectName, branch)
+
+	// Ensure base RAM directory exists (parent dir for ramdir entries)
+	baseRam := ramDir(projectName, branch)
+	os.MkdirAll(baseRam, 0755)
+
+	// Re-create RAM directory entries on every open (handles reboot, etc.).
+	// Re-create RAM directory entries when missing or stale (handles reboot).
+	// After a reboot the tmpfs is gone, but the mount point directory persists
+	// as an empty regular directory. Use isTmpfs (syscall.Statfs) to distinguish:
+	//   - tmpfs mount → proper, skip
+	//   - not tmpfs (empty leftover dir, or missing) → recreate
+	// Safety: if the path is a non-empty regular dir (non-root fallback from
+	// a previous run), skip to avoid mounting a fresh empty tmpfs over it.
+	if resolved != nil {
+		for _, entry := range resolved.RamDir {
+			subPath := ramDirSubPath(projectName, branch, entry.Path)
+
+			if isTmpfs(subPath) {
+				// Already a proper tmpfs mount — nothing to do
+				continue
+			}
+
+			// Not a tmpfs. Safety check: if the path is a non-empty regular dir,
+			// it may be a fallback from a previous non-root run with user data.
+			if fi, err := os.Stat(subPath); err == nil && fi.IsDir() {
+				entries, _ := os.ReadDir(subPath)
+				if len(entries) > 0 {
+					slog.Warn("RAM dir has data but is not tmpfs; skipping to preserve contents", "path", entry.Path)
+					continue
+				}
+			}
+
+			// Missing or empty — recreate everything
+			slog.Info("RAM dir not tmpfs, re-creating", "path", entry.Path)
+			os.Remove(filepath.Join(target, entry.Path)) // clean up dangling symlink
+			if err := mountRamDirEntry(projectName, branch, entry, target); err != nil {
+				slog.Warn("failed to re-create RAM directory entry", "path", entry.Path, "error", err)
+			}
+		}
+	}
 
 	// Run setup commands if config provides them (respects setup_oneshot)
 	runSetupIfNeeded(projectName, branch, target, resolved)

@@ -7,7 +7,7 @@ A single Go binary that provides local development utilities for AI agent workfl
 - **Built-in DNS** — automatically resolves `*.test` domains to your machine's IP (zero-config)
 - **Worktree manager** — create/remove/open/list git worktrees with tmux sessions and RAM-backed data
 - **Auto-cleanup** — uploaded files clean up after 1 hour
-- **No dependencies** — uses only Go standard library
+- **Minimal dependencies** — only `golang.org/x/net/ipv4` (Go team-maintained sub-repo); everything else is Go standard library
 
 ## Quick Start
 
@@ -54,6 +54,7 @@ aru proxy del --name=myapp
 ### 📁 File upload at `tmp.test`
 
 Open `https://tmp.test/` for a dark-themed upload UI:
+
 - **Click** to select files (stages them — press Upload to confirm)
 - **Drag and drop** files onto the drop zone (auto-uploads immediately)
 - **Paste** images from clipboard (auto-uploads immediately)
@@ -63,9 +64,12 @@ Open `https://tmp.test/` for a dark-themed upload UI:
 
 The built-in DNS server automatically resolves `*.test` domains to your machine's IP:
 
-- Queries from local machine → `127.0.0.1` (works locally)
-- Queries from LAN devices → your machine's LAN IP (works on network)
-- Non-`.test` queries → NXDOMAIN (not an open resolver)
+- It uses **IP_PKTINFO** socket control messages (via `golang.org/x/net/ipv4`) to extract the **exact destination IP** each DNS query arrived on — no subnet matching, no heuristics
+- This works correctly with **any interface type**: Tailscale (`/32`), LAN (`/24`), Docker bridges, VPNs — the kernel tells us the IP directly
+- Queries from a remote Tailscale client → the server's **Tailscale IP** (e.g., `100.x.x.x`)
+- Queries from local machine → `127.0.0.1`
+- Queries from LAN devices → your machine's LAN IP
+- Non-`.test` queries → REFUSED (allows client fallback to secondary DNS)
 
 If port 53 is already in use (e.g., `systemd-resolved`), the server logs a warning and continues without DNS — use `/etc/hosts` as fallback.
 
@@ -163,6 +167,7 @@ Because you already have full shell access, the commands in `aru.json` provide n
 **SIGINT behavior:** Tmux commands get a `trap ':' INT` handler so the outer shell survives Ctrl+C and drops into a fallback bash shell. Child processes remain interruptible (default SIG_DFL disposition). This prevents accidentally closing the entire tmux window when pressing Ctrl+C on a dev server.
 
 Placeholders:
+
 - `<PROJECT>` — directory name of the main worktree
 - `<BRANCH>` — branch name being checked out
 - `<PORT1>`, `<PORT2>`, ... — allocated open ports (numbers map to specific ports, reused across `add` and `open` for consistency)
@@ -242,11 +247,13 @@ The `--install-service` flag generates the service file at `/etc/systemd/system/
 Accepts multipart form data with field `file` or `files`.
 
 Response (single file):
+
 ```json
 {"path": "@/tmp/u/ab7x.jpg"}
 ```
 
 Response (multiple files):
+
 ```json
 {"paths": ["@/tmp/u/ab7x.jpg", "@/tmp/u/cd8y.png"]}
 ```
@@ -261,7 +268,7 @@ proxydb.go      — persistent proxy database (JSON-backed, thread-safe, hot-rel
 worktree.go     — git worktree manager (add/del/open/list), aru.json config, RAM dir, tmux sessions
 aruconfig.go    — aru.json config types, parsing, struct-walking placeholder resolution
 cert.go         — self-signed TLS certificate with wildcard SANs (*.test, tmp.test)
-dns.go          — built-in DNS server for *.test domains
+dns.go          — built-in DNS server for *.test domains (IP_PKTINFO destination-IP extraction)
 redirect.go     — HTTP → HTTPS redirect server
 upload.go       — file upload handler, name generation
 cleanup.go      — background file cleanup goroutine
@@ -301,14 +308,18 @@ All persistent data lives under `~/.aru/`:
 
 ### Packages
 
-Uses only Go standard library packages: `net/http`, `net/http/httputil`, `crypto/tls`, `crypto/x509`, `crypto/rand`, `embed`, `log/slog`, `net`, `os`, `sync`, `time`, `io`, `mime/multipart`, `flag`.
+Uses Go standard library packages plus **one Go team-maintained sub-repo**:
+
+- `golang.org/x/net/ipv4` — IP_PKTINFO control messages for DNS destination-IP discovery
+
+Standard library packages: `net/http`, `net/http/httputil`, `crypto/tls`, `crypto/x509`, `crypto/rand`, `embed`, `log/slog`, `net`, `os`, `sync`, `time`, `io`, `mime/multipart`, `flag`.
 
 ## Development
 
 ### Prerequisites
 
 - Go 1.26.3 or later
-- No external dependencies required
+- `golang.org/x/net/ipv4` (fetched automatically by Go modules)
 
 ### Running tests
 

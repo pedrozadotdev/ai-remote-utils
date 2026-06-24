@@ -8,6 +8,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 // DNS response codes.
@@ -142,81 +144,29 @@ func buildDNSResponse(query []byte, qname string, qtype, qclass uint16, question
 	return buf
 }
 
-// getInterfaceIPs returns a list of non-loopback interface IPv4 subnets.
-func getInterfaceIPs() []*net.IPNet {
-	var ips []*net.IPNet
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return ips
-	}
-	for _, iface := range ifaces {
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			ipnet, ok := addr.(*net.IPNet)
-			if !ok {
-				continue
-			}
-			ip := ipnet.IP.To4()
-			if ip == nil {
-				continue
-			}
-			if ip.IsLoopback() {
-				continue
-			}
-			ips = append(ips, ipnet)
-		}
-	}
-	return ips
-}
-
-// findInterfaceIP finds the best IP to respond with based on the source address.
-// For each interface, it checks if the source is within the interface's configured subnet.
-// Falls back to 127.0.0.1 if no match is found or source is loopback.
-func findInterfaceIP(src net.IP, ifaceIPs []*net.IPNet) net.IP {
-	if src == nil {
-		return net.IPv4(127, 0, 0, 1).To4()
-	}
-
-	// If source is loopback, return 127.0.0.1
-	if src.IsLoopback() {
-		return net.IPv4(127, 0, 0, 1).To4()
-	}
-
-	// Try to find a matching interface IP on the same subnet
-	src4 := src.To4()
-	if src4 == nil {
-		return net.IPv4(127, 0, 0, 1).To4()
-	}
-
-	for _, iface := range ifaceIPs {
-		if iface == nil || iface.IP == nil {
-			continue
-		}
-		// Use the actual subnet mask (e.g., /10 for Tailscale CG-NAT) to match
-		if iface.Contains(src) {
-			return iface.IP.To4()
-		}
-	}
-
-	// Fallback
-	return net.IPv4(127, 0, 0, 1).To4()
-}
-
 // StartDNS starts a DNS server on UDP port 53 that responds to *.test A-record
-// queries with the IP address of the receiving interface.
+// queries with the exact IP address the query arrived on.
+//
+// It uses IP_PKTINFO control messages (via golang.org/x/net/ipv4) to extract
+// the destination IP from each incoming UDP packet. This is the only reliable
+// way to determine the correct IP to return when the server has multiple
+// interfaces (Tailscale, Docker, VPNs, etc.), since Tailscale uses /32
+// addressing and neither subnet matching nor source-IP heuristics work.
+//
 // Returns nil (non-fatal) if binding port 53 fails.
 func StartDNS(ctx context.Context) error {
-	// Enumerate interface IPs at startup
-	ifaceIPs := getInterfaceIPs()
-
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 53})
 	if err != nil {
 		slog.Warn("DNS server disabled: cannot bind port 53", "error", err)
 		slog.Warn("  Use /etc/hosts as fallback or disable systemd-resolved: systemctl stop systemd-resolved")
 		return nil // non-fatal
+	}
+
+	// Wrap the connection to receive IP_PKTINFO control messages,
+	// which carry the exact destination IP of each received UDP packet.
+	pconn := ipv4.NewPacketConn(conn)
+	if err := pconn.SetControlMessage(ipv4.FlagDst, true); err != nil {
+		slog.Warn("DNS server: cannot enable destination IP control message, falling back to 127.0.0.1", "error", err)
 	}
 
 	slog.Info("DNS server listening", "addr", conn.LocalAddr().String())
@@ -237,7 +187,7 @@ func StartDNS(ctx context.Context) error {
 			}
 
 			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			n, srcAddr, err := conn.ReadFromUDP(buf)
+			n, cm, srcAddr, err := pconn.ReadFrom(buf)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -245,9 +195,23 @@ func StartDNS(ctx context.Context) error {
 				continue // timeout or transient error
 			}
 
+			srcUDPAddr, ok := srcAddr.(*net.UDPAddr)
+			if !ok {
+				continue
+			}
+
 			query := make([]byte, n)
 			copy(query, buf[:n])
-			go handleDNSQuery(conn, srcAddr, query, ifaceIPs)
+
+			// Extract the exact destination IP from the IP_PKTINFO control message.
+			// This tells us exactly which local interface IP the query arrived on,
+			// regardless of subnet mask (/24, /10, /32, etc.).
+			localIP := net.IPv4(127, 0, 0, 1)
+			if cm != nil && cm.Dst != nil {
+				localIP = cm.Dst
+			}
+
+			go handleDNSQuery(conn, srcUDPAddr, query, localIP)
 		}
 	}()
 
@@ -255,7 +219,7 @@ func StartDNS(ctx context.Context) error {
 }
 
 // handleDNSQuery processes a single DNS query and sends a response.
-func handleDNSQuery(conn *net.UDPConn, src *net.UDPAddr, query []byte, ifaceIPs []*net.IPNet) {
+func handleDNSQuery(conn *net.UDPConn, src *net.UDPAddr, query []byte, localIP net.IP) {
 	if len(query) < 12 {
 		slog.Debug("DNS: query too short", "len", len(query))
 		return
@@ -267,7 +231,7 @@ func handleDNSQuery(conn *net.UDPConn, src *net.UDPAddr, query []byte, ifaceIPs 
 		return
 	}
 
-	slog.Debug("DNS query", "name", qname, "type", qtype, "src", src.IP)
+	slog.Debug("DNS query", "name", qname, "type", qtype, "src", src.IP, "local", localIP)
 
 	// Only respond to A-record queries for *.test domains
 	// Non-matching queries get REFUSED so the client falls back to its secondary DNS
@@ -283,8 +247,7 @@ func handleDNSQuery(conn *net.UDPConn, src *net.UDPAddr, query []byte, ifaceIPs 
 		return
 	}
 
-	// Find the best IP for the source
-	ip := findInterfaceIP(src.IP, ifaceIPs)
-	resp := buildDNSResponse(query, qname, qtype, qclass, consumed, ip, dnsRcodeSuccess)
+	// Respond with the exact IP the query arrived on
+	resp := buildDNSResponse(query, qname, qtype, qclass, consumed, localIP, dnsRcodeSuccess)
 	conn.WriteToUDP(resp, src)
 }

@@ -192,48 +192,6 @@ func TestIsTestDomain(t *testing.T) {
 	}
 }
 
-func TestFindInterfaceIP_LoopbackSource(t *testing.T) {
-	// Source is loopback → should return 127.0.0.1
-	ip := findInterfaceIP(net.IPv4(127, 0, 0, 1).To4(), nil)
-	if ip == nil || !ip.Equal(net.IPv4(127, 0, 0, 1)) {
-		t.Errorf("expected 127.0.0.1 for loopback source, got %v", ip)
-	}
-}
-
-func TestFindInterfaceIP_EmptyInterfaces(t *testing.T) {
-	// No interfaces available → fallback to 127.0.0.1
-	ip := findInterfaceIP(net.IPv4(192, 168, 1, 50).To4(), nil)
-	if ip == nil || !ip.Equal(net.IPv4(127, 0, 0, 1)) {
-		t.Errorf("expected 127.0.0.1 fallback, got %v", ip)
-	}
-}
-
-func TestFindInterfaceIP_SubnetMatch(t *testing.T) {
-	ifaces := []*net.IPNet{{
-		IP:   net.IPv4(192, 168, 1, 100).To4(),
-		Mask: net.CIDRMask(24, 32),
-	}}
-	// Different subnet → no match, fallback to 127.0.0.1
-	ip := findInterfaceIP(net.IPv4(10, 0, 0, 50).To4(), ifaces)
-	if ip == nil || !ip.Equal(net.IPv4(127, 0, 0, 1)) {
-		t.Errorf("expected 127.0.0.1 fallback for different subnet, got %v", ip)
-	}
-}
-
-func TestFindInterfaceIP_TailscaleSubnet(t *testing.T) {
-	// Simulate Tailscale /10 CG-NAT: server at 100.115.92.1/10,
-	// client at 100.80.5.50 — different second/third octets but same /10
-	ifaces := []*net.IPNet{{
-		IP:   net.IPv4(100, 115, 92, 1).To4(),
-		Mask: net.CIDRMask(10, 32),
-	}}
-
-	ip := findInterfaceIP(net.IPv4(100, 80, 5, 50).To4(), ifaces)
-	if ip == nil || !ip.Equal(net.IPv4(100, 115, 92, 1).To4()) {
-		t.Errorf("expected Tailscale interface IP for same /10 subnet, got %v", ip)
-	}
-}
-
 func TestBuildDNSResponse_NoExtraBytesWithEDNS0(t *testing.T) {
 	// Simulate a query WITH an EDNS0 OPT record in the additional section
 	// (as dig sends by default)
@@ -307,23 +265,5 @@ func TestBuildDNSResponse_NonTestRefused(t *testing.T) {
 	if len(resp) > expectedSize {
 		t.Errorf("REFUSED response has %d extra bytes: len=%d, expected=%d",
 			len(resp)-expectedSize, len(resp), expectedSize)
-	}
-}
-
-func TestGetInterfaceIPs_ExcludesLoopback(t *testing.T) {
-	ips := getInterfaceIPs()
-	for _, iface := range ips {
-		if iface.IP.IsLoopback() {
-			t.Errorf("getInterfaceIPs() returned loopback IP %v, expected non-loopback only", iface.IP)
-		}
-	}
-}
-
-func TestGetInterfaceIPs_NoNilEntries(t *testing.T) {
-	ips := getInterfaceIPs()
-	for i, iface := range ips {
-		if iface == nil {
-			t.Errorf("getInterfaceIPs()[%d] is nil", i)
-		}
 	}
 }

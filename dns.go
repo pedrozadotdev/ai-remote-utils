@@ -142,9 +142,9 @@ func buildDNSResponse(query []byte, qname string, qtype, qclass uint16, question
 	return buf
 }
 
-// getInterfaceIPs returns a list of non-loopback interface IPv4 addresses.
-func getInterfaceIPs() []net.IP {
-	var ips []net.IP
+// getInterfaceIPs returns a list of non-loopback interface IPv4 subnets.
+func getInterfaceIPs() []*net.IPNet {
+	var ips []*net.IPNet
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return ips
@@ -166,16 +166,16 @@ func getInterfaceIPs() []net.IP {
 			if ip.IsLoopback() {
 				continue
 			}
-			ips = append(ips, ip)
+			ips = append(ips, ipnet)
 		}
 	}
 	return ips
 }
 
 // findInterfaceIP finds the best IP to respond with based on the source address.
-// It matches the source's subnet against all known interface IPs.
+// For each interface, it checks if the source is within the interface's configured subnet.
 // Falls back to 127.0.0.1 if no match is found or source is loopback.
-func findInterfaceIP(src net.IP, ifaceIPs []net.IP) net.IP {
+func findInterfaceIP(src net.IP, ifaceIPs []*net.IPNet) net.IP {
 	if src == nil {
 		return net.IPv4(127, 0, 0, 1).To4()
 	}
@@ -191,13 +191,13 @@ func findInterfaceIP(src net.IP, ifaceIPs []net.IP) net.IP {
 		return net.IPv4(127, 0, 0, 1).To4()
 	}
 
-	for _, ifIP := range ifaceIPs {
-		if ifIP == nil {
+	for _, iface := range ifaceIPs {
+		if iface == nil || iface.IP == nil {
 			continue
 		}
-		// Simple /24 subnet match (first 3 octets match)
-		if src4[0] == ifIP[0] && src4[1] == ifIP[1] && src4[2] == ifIP[2] {
-			return ifIP
+		// Use the actual subnet mask (e.g., /10 for Tailscale CG-NAT) to match
+		if iface.Contains(src) {
+			return iface.IP.To4()
 		}
 	}
 
@@ -255,7 +255,7 @@ func StartDNS(ctx context.Context) error {
 }
 
 // handleDNSQuery processes a single DNS query and sends a response.
-func handleDNSQuery(conn *net.UDPConn, src *net.UDPAddr, query []byte, ifaceIPs []net.IP) {
+func handleDNSQuery(conn *net.UDPConn, src *net.UDPAddr, query []byte, ifaceIPs []*net.IPNet) {
 	if len(query) < 12 {
 		slog.Debug("DNS: query too short", "len", len(query))
 		return

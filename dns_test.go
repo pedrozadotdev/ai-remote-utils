@@ -209,11 +209,28 @@ func TestFindInterfaceIP_EmptyInterfaces(t *testing.T) {
 }
 
 func TestFindInterfaceIP_SubnetMatch(t *testing.T) {
-	ifaces := []net.IP{net.IPv4(192, 168, 1, 100).To4()}
+	ifaces := []*net.IPNet{{
+		IP:   net.IPv4(192, 168, 1, 100).To4(),
+		Mask: net.CIDRMask(24, 32),
+	}}
 	// Different subnet → no match, fallback to 127.0.0.1
 	ip := findInterfaceIP(net.IPv4(10, 0, 0, 50).To4(), ifaces)
 	if ip == nil || !ip.Equal(net.IPv4(127, 0, 0, 1)) {
 		t.Errorf("expected 127.0.0.1 fallback for different subnet, got %v", ip)
+	}
+}
+
+func TestFindInterfaceIP_TailscaleSubnet(t *testing.T) {
+	// Simulate Tailscale /10 CG-NAT: server at 100.115.92.1/10,
+	// client at 100.80.5.50 — different second/third octets but same /10
+	ifaces := []*net.IPNet{{
+		IP:   net.IPv4(100, 115, 92, 1).To4(),
+		Mask: net.CIDRMask(10, 32),
+	}}
+
+	ip := findInterfaceIP(net.IPv4(100, 80, 5, 50).To4(), ifaces)
+	if ip == nil || !ip.Equal(net.IPv4(100, 115, 92, 1).To4()) {
+		t.Errorf("expected Tailscale interface IP for same /10 subnet, got %v", ip)
 	}
 }
 
@@ -295,17 +312,17 @@ func TestBuildDNSResponse_NonTestRefused(t *testing.T) {
 
 func TestGetInterfaceIPs_ExcludesLoopback(t *testing.T) {
 	ips := getInterfaceIPs()
-	for _, ip := range ips {
-		if ip.IsLoopback() {
-			t.Errorf("getInterfaceIPs() returned loopback IP %v, expected non-loopback only", ip)
+	for _, iface := range ips {
+		if iface.IP.IsLoopback() {
+			t.Errorf("getInterfaceIPs() returned loopback IP %v, expected non-loopback only", iface.IP)
 		}
 	}
 }
 
 func TestGetInterfaceIPs_NoNilEntries(t *testing.T) {
 	ips := getInterfaceIPs()
-	for i, ip := range ips {
-		if ip == nil {
+	for i, iface := range ips {
+		if iface == nil {
 			t.Errorf("getInterfaceIPs()[%d] is nil", i)
 		}
 	}

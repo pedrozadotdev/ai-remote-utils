@@ -98,7 +98,7 @@ aru worktree list
 - Port persistence: allocated ports survive reboots via `~/.aru/state/<project>/<branch>/ports.json`
 - Setup idempotency: `setup_oneshot: true` runs setup only once per worktree session (marker at `~/.aru/state/<project>/<branch>/setup-complete`)
 - RAM directory entries auto-recreated on `open` using `syscall.Statfs` to detect reboot (distinguishes tmpfs from leftover ext4 mount-point directories; skips non-empty fallback dirs to preserve user data)
-- Setup and teardown commands run verbatim via `bash -c` (see trust model below)
+- Setup and teardown commands run verbatim via the detected shell (`$SHELL` → `bash` → `sh`) (see trust model below)
 
 #### 🔐 Trust model for `aru.json` commands
 
@@ -150,12 +150,12 @@ Because you already have full shell access, the commands in `aru.json` provide n
 ```
 
 - `version` — schema version (currently optional, reserved for future migrations)
-- `worktree.setup` — list of shell commands to run on `aru worktree add` and `aru worktree open`. Commands run verbatim via `bash -c` (see trust model below for security implications)
+- `worktree.setup` — list of shell commands to run on `aru worktree add` and `aru worktree open`. Commands run verbatim via the detected shell (see trust model below for security implications)
 - `worktree.setup_oneshot` — if `true`, setup runs only once per worktree session. A marker file at `~/.aru/state/<project>/<branch>/setup-complete` records that setup has run; subsequent opens skip setup. The marker is removed when the worktree is deleted. To force re-run, delete the marker file manually.
 - `worktree.teardown` — list of shell commands to run on `aru worktree del`
 - `tmux` — **ordered array** of tmux window definitions. The first entry is created via `new-session`, subsequent entries via `new-window`. Each entry has:
   - `name` — window name (placeholders supported)
-  - `command` — shell command to run (runs verbatim via `bash -c`)
+  - `command` — shell command to run (runs verbatim via the detected shell)
   - `env` — optional map of environment variables (values are shell-escaped)
 - `proxy` — **array** of reverse proxy registrations (supports multiple proxies). Each entry has:
   - `name` — proxy name with `<PROJECT>`/`<BRANCH>` placeholders for dynamic naming. Can contain dots for multi-level subdomains (e.g., `api.myapp.test`).
@@ -164,7 +164,7 @@ Because you already have full shell access, the commands in `aru.json` provide n
   - `path` — worktree-relative path for the tmpfs mount point (e.g., `"data"`, `"cache/build"`). Parent directories are created automatically.
   - `size` — optional tmpfs size specifier (e.g., `"200M"`, `"1G"`). Defaults to `"200M"` when omitted.
 
-**SIGINT behavior:** Tmux commands get a `trap ':' INT` handler so the outer shell survives Ctrl+C and drops into a fallback bash shell. Child processes remain interruptible (default SIG_DFL disposition). This prevents accidentally closing the entire tmux window when pressing Ctrl+C on a dev server.
+**SIGINT behavior:** Tmux commands get a `trap ':' INT` handler so the outer shell survives Ctrl+C and drops into a fallback shell. Child processes remain interruptible (default SIG_DFL disposition). This prevents accidentally closing the entire tmux window when pressing Ctrl+C on a dev server.
 
 Placeholders:
 

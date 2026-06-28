@@ -15,7 +15,7 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 | Change proxy persistence | `proxydb.go` — ProxyDB (Load/Save/Add/Delete/Get/List/Refresh); `proxydb_test.go` |
 | Change proxy management CLI | `main.go` — `handleProxySubcommand`, `handleProxyAdd`, `handleProxyDel`, `handleProxyList` |
 | Change aru.json config parsing | `aruconfig.go` — `ParseAruConfig`, `collectPortPlaceholders`, `resolvePlaceholders`, `cloneConfig`; `aruconfig_test.go`. Types: `AruConfig` (ramdir as `[]RamDirConfig`, tmux as `[]TmuxWindowEntry`, proxy as `[]ProxyConfig`), `RamDirConfig` (path+size), `TmuxWindowEntry` (name+command+env), `ProxyConfig`. No `ResolvedConfig` or `flattenConfig` — `AruConfig` used directly. |
-| Change worktree behavior | `worktree.go` — `handleWorktreeAdd`, `handleWorktreeDel`, `handleWorktreeOpen`, `handleWorktreeList`, `readConfig`, `runSetupIfNeeded`, `setupProxy`/`removeProxy`; `worktree_test.go`. RAM dir: `mountRamDirEntry`/`unmountRamDirEntry`/`ramDirSubPath`, `mountRamDir(path, size)`, `isTmpfs`. Tmux config type is `[]TmuxWindowEntry` (ordered slice), not `TmuxConfig` (map). Proxy config is `[]ProxyConfig` (supports multi-proxy). `ResolvedConfig` removed — use `AruConfig.Worktree.*` directly. |
+| Change worktree behavior | `worktree.go` — `handleWorktreeAdd`, `handleWorktreeDel`, `handleWorktreeOpen`, `handleWorktreeList`, `readConfig`, `runSetupIfNeeded`, `setupProxy`/`removeProxy`, `resolveShell`/`detectShell`; `worktree_test.go`. RAM dir: `mountRamDirEntry`/`unmountRamDirEntry`/`ramDirSubPath`, `mountRamDir(path, size)`, `isTmpfs`. Tmux config type is `[]TmuxWindowEntry` (ordered slice), not `TmuxConfig` (map). Proxy config is `[]ProxyConfig` (supports multi-proxy). `ResolvedConfig` removed — use `AruConfig.Worktree.*` directly. Shell detection: `resolveShell()` (pure detection, fallback chain) + `detectShell()` (cached, bool+string for test isolation). |
 | Add worktree subcommand | `main.go` — add `"worktree"` case to subcommand switch alongside `"proxy"` |
 | Change HTTP redirect | `redirect.go` — `StartRedirect`; `redirect_test.go` |
 | Add/change routes or middleware | `server.go` — `NewServer` virtual host mux; `server_test.go` |
@@ -93,7 +93,8 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 - Config file required: `setupTmuxSession` returns an error if no `aru.json` with a `tmux` section is found. There is no fallback minimal session.
 - Stale socket file (`~/.aru/sockets/<project>-<branch>.sock`) is only removed when creating a new session, not unconditionally at the start of `setupTmuxSession`. This avoids wiping the socket for an existing session.
 - New sessions select window 0 after creation (`select-window -t <session>:0`) for consistent UX.
-- SIGINT trap (`trap ':' INT`) is prepended to tmux command strings so the outer shell survives Ctrl+C and drops into a fallback bash shell. Child processes remain interruptible (default SIG_DFL).
+- SIGINT trap (`trap ':' INT`) is prepended to tmux command strings so the outer shell survives Ctrl+C and drops into a fallback shell. Child processes remain interruptible (default SIG_DFL).
+- Shell detection: commands use `detectShell()` which resolves via `$SHELL` (basename via `exec.LookPath`) → `bash` → `sh`. Tmux uses `default-shell` (session-scoped, no `-g`) instead of `default-command`. Fallback interactive shells use `-l` (login shell). See `docs/solutions/go-shell-detection-fallback-chain-tmux.md`.
 
 ### Reverse proxy conventions
 
@@ -137,6 +138,10 @@ When these code patterns appear in a diff, flag for review:
 - **Per-entry parent dirs not created** — `mountRamDirEntry` calls `os.MkdirAll` on the subPath, which handles nested paths (e.g., `cache/build`). Ensure `os.MkdirAll` is used, not `os.Mkdir`.
 - **`cloneConfig` missing `RamDir` field** — when cloning an `AruConfig`, `RamDir` must be deep-copied via `make([]RamDirConfig, len(...))` + `copy`. A missing `RamDir` in `cloneConfig` means ramdir entries are silently dropped during placeholder resolution.
 - **`RamDir` not added to struct walker** — `collectPortNumbers` and `applyPlaceholders` must traverse `cfg.RamDir[].Path` and `cfg.RamDir[].Size` (strings with placeholders). Missing traversal means placeholders in ramdir entries are never resolved.
+- **Shell detection: `resetDetectShell()` not called** — every test using `detectShell()` must call `resetDetectShell()` first. Without it, the package-level cache persists across tests, causing test-order dependencies.
+- **Shell detection: missing `SHELL` determinism** — every test of functions that call `detectShell()` must set `t.Setenv("SHELL", "/bin/bash")` explicitly. Without it, results depend on the developer's own `$SHELL`.
+- **Shell detection: tmux `default-command` vs `default-shell`** — use `default-shell` (session-scoped, no `-g`) instead of `default-command`. `default-shell` is the shell that interprets commands; `default-command` is a fixed initial command.
+- **Shell detection: tmux `-g` on `default-shell`** — `default-shell` must NOT use `-g` (global). It must be session-scoped to avoid leaking configuration to other tmux sessions.
 
 ## Pipeline Workflow
 
@@ -159,6 +164,7 @@ Project-specific solutions at `docs/solutions/`:
 - `go-struct-walking-placeholder-resolution.md` — Go struct-walking placeholder resolution (replaces marshal-replace-unmarshal to avoid JSON injection)
 - `go-port-state-persistence-lifecycle.md` — Go resource-scoped state persistence with lifecycle management (allocate, persist, load, remove, fallback) for per-resource JSON state files
 - `go-syscall-statfs-tmpfs-detection.md` — Detecting tmpfs vs. regular filesystem via `syscall.Statfs` to survive reboots
+- `go-shell-detection-fallback-chain-tmux.md` — Detecting the user's default shell (`$SHELL` → `bash` → `sh`) for tmux sessions and command execution in Go CLI tools
 
 Global solutions at `~/.pi/agent/docs/solutions/`:
 

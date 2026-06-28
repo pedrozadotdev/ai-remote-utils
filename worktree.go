@@ -358,6 +358,73 @@ func isTmpfs(path string) bool {
 	return stat.Type == 0x01021994
 }
 
+// ── Shell detection ────────────────────────────────────────────────────────
+
+// cachedShell is the lazily-resolved shell path, populated by detectShell.
+var (
+	shellDetected bool
+	cachedShell   string
+)
+
+// resolveShell resolves the shell to use for tmux sessions and command
+// execution. Resolution order:
+//
+//  1. $SHELL env var — try exec.LookPath on the absolute path first;
+//     if that fails, try exec.LookPath on the basename.
+//  2. "bash" — if $SHELL is unset or not found, try bash.
+//  3. "sh" — if bash is also not found, try sh.
+//  4. If no shell can be found at all (shouldn't happen on any reasonable
+//     system), print an error to stderr and exit with status 1.
+//
+// Only the basename is returned (e.g., "zsh", "bash"), because tmux's
+// default-shell option accepts basenames and looks them up in PATH.
+func resolveShell() string {
+	// Step 1: Try $SHELL
+	if shell := os.Getenv("SHELL"); shell != "" {
+		// Try the absolute path first
+		if _, err := exec.LookPath(shell); err == nil {
+			return filepath.Base(shell)
+		}
+		// Try the basename in PATH
+		if base := filepath.Base(shell); base != "" {
+			if _, err := exec.LookPath(base); err == nil {
+				return base
+			}
+		}
+	}
+
+	// Step 2: Try bash
+	if _, err := exec.LookPath("bash"); err == nil {
+		return "bash"
+	}
+
+	// Step 3: Try sh
+	if _, err := exec.LookPath("sh"); err == nil {
+		return "sh"
+	}
+
+	// Step 4: Nothing found — hard error
+	fmt.Fprintln(os.Stderr, "ERROR: no shell available (tried $SHELL, bash, sh)")
+	os.Exit(1)
+	return "" // unreachable
+}
+
+// detectShell returns the detected shell, cached after first resolution.
+// Thread-safe after initialization (the bool + string pair is only written
+// once, and after that only read). Not safe for concurrent initialization.
+//
+// Note: Uses bool+string instead of sync.Once so that resetDetectShell()
+// (used in tests) can clear the cached value. If sync.Once were used, there
+// would be no way to reset the cache for test isolation. Do not "fix" this
+// back to sync.Once without providing a test-reset mechanism.
+func detectShell() string {
+	if !shellDetected {
+		cachedShell = resolveShell()
+		shellDetected = true
+	}
+	return cachedShell
+}
+
 // ── Config-based lifecycle helpers ───────────────────────────────────────
 
 // TRUST MODEL: All commands in aru.json (setup, teardown, tmux windows) run
@@ -372,7 +439,7 @@ func isTmpfs(path string) bool {
 //   - If you copy aru.json from an untrusted source, treat it as code execution.
 //   - There is no in-process sandbox; commands run with full user permissions.
 
-// runSetupCommands runs each setup command in order with bash -c.
+// runSetupCommands runs each setup command in order with the detected shell.
 // If a command fails, a warning is logged but execution continues.
 //
 // Commands are run verbatim from the user's aru.json. See the TRUST MODEL
@@ -380,7 +447,7 @@ func isTmpfs(path string) bool {
 func runSetupCommands(target string, commands []string) {
 	for _, cmdStr := range commands {
 		slog.Info("running setup command", "dir", target, "command", cmdStr)
-		cmd := exec.Command("bash", "-c", cmdStr)
+		cmd := exec.Command(detectShell(), "-c", cmdStr)
 		cmd.Dir = target
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -390,7 +457,7 @@ func runSetupCommands(target string, commands []string) {
 	}
 }
 
-// runTeardownCommands runs each teardown command in order with bash -c.
+// runTeardownCommands runs each teardown command in order with the detected shell.
 // If a command fails, a warning is logged but execution continues.
 //
 // Commands are run verbatim from the user's aru.json. See the TRUST MODEL
@@ -398,7 +465,7 @@ func runSetupCommands(target string, commands []string) {
 func runTeardownCommands(target string, commands []string) {
 	for _, cmdStr := range commands {
 		slog.Info("running teardown command", "dir", target, "command", cmdStr)
-		cmd := exec.Command("bash", "-c", cmdStr)
+		cmd := exec.Command(detectShell(), "-c", cmdStr)
 		cmd.Dir = target
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -436,7 +503,7 @@ func runSetupIfNeeded(project, branch, target string, resolved *AruConfig) {
 }
 
 // buildTmuxCommand constructs a tmux command string from a TmuxWindow config.
-// Format: trap ':' INT; export K1=V1; export K2=V2; command; exec bash
+// Format: trap ':' INT; export K1=V1; export K2=V2; command; exec <detected shell>
 //
 // SECURITY: Env values are shell-escaped with strconv.Quote to prevent
 // injection via crafted env values (e.g., a value containing `; rm -rf /`).
@@ -449,9 +516,9 @@ func buildTmuxCommand(win TmuxWindow) string {
 	var parts []string
 
 	// Install a no-op SIGINT handler so the shell survives Ctrl+C on the
-	// command and continues to exec bash (fallback shell). Child processes
-	// get the default disposition (SIG_DFL), so the command is still
-	// interruptible — only the outer shell has the handler.
+	// command and continues to exec the detected shell (fallback shell).
+	// Child processes get the default disposition (SIG_DFL), so the
+	// command is still interruptible — only the outer shell has the handler.
 	parts = append(parts, "trap ':' INT")
 
 	// Sort env keys for deterministic output
@@ -470,7 +537,7 @@ func buildTmuxCommand(win TmuxWindow) string {
 		parts = append(parts, win.Command)
 	}
 
-	parts = append(parts, "exec bash")
+	parts = append(parts, "exec "+detectShell())
 	return strings.Join(parts, "; ")
 }
 
@@ -874,7 +941,7 @@ func buildSessionArgs(sock, sessionName, worktreeDir, windowName, cmdStr string)
 		";", "set-option", "-g", "allow-passthrough", "on",
 		";", "set-option", "-g", "mouse", "on",
 		";", "set-option", "-s", "escape-time", "10",
-		";", "set-option", "-g", "default-command", "bash",
+		";", "set-option", "default-shell", detectShell(),
 		";", "set-option", "-qs", "extended-keys", "off",
 		";", "set-option", "-qg", "extended-keys", "off",
 	}
@@ -977,14 +1044,18 @@ func handleWorktreeAdd(branch string) {
 	// Launch tmux session
 	fmt.Printf("\nEntering worktree and starting tmux session...\n")
 	if err := setupTmuxSession(projectName, branch, target, tmuxConfig); err != nil {
-		slog.Warn("failed to start tmux session, falling back to bash", "error", err)
-		fmt.Printf("Falling back to bash in %s\n", target)
-		os.Chdir(target)
-		bashCmd := exec.Command("bash")
-		bashCmd.Stdin = os.Stdin
-		bashCmd.Stdout = os.Stdout
-		bashCmd.Stderr = os.Stderr
-		bashCmd.Run()
+		slog.Warn("failed to start tmux session, falling back to shell", "error", err)
+		fmt.Printf("Falling back to shell in %s\n", target)
+		if err := os.Chdir(target); err != nil {
+			slog.Warn("fallback chdir to worktree failed, shell may run in unexpected directory", "target", target, "error", err)
+		}
+		shellCmd := exec.Command(detectShell(), "-l")
+		shellCmd.Stdin = os.Stdin
+		shellCmd.Stdout = os.Stdout
+		shellCmd.Stderr = os.Stderr
+		if err := shellCmd.Run(); err != nil {
+			slog.Warn("fallback shell exited with error", "error", err)
+		}
 	}
 }
 
@@ -1155,14 +1226,18 @@ func handleWorktreeOpen(branch string) {
 
 	// Attach tmux session with config
 	if err := setupTmuxSession(projectName, branch, target, tmuxConfig); err != nil {
-		slog.Warn("failed to start tmux session, falling back to bash", "error", err)
-		fmt.Printf("Falling back to bash in %s\n", target)
-		os.Chdir(target)
-		bashCmd := exec.Command("bash")
-		bashCmd.Stdin = os.Stdin
-		bashCmd.Stdout = os.Stdout
-		bashCmd.Stderr = os.Stderr
-		bashCmd.Run()
+		slog.Warn("failed to start tmux session, falling back to shell", "error", err)
+		fmt.Printf("Falling back to shell in %s\n", target)
+		if err := os.Chdir(target); err != nil {
+			slog.Warn("fallback chdir to worktree failed, shell may run in unexpected directory", "target", target, "error", err)
+		}
+		shellCmd := exec.Command(detectShell(), "-l")
+		shellCmd.Stdin = os.Stdin
+		shellCmd.Stdout = os.Stdout
+		shellCmd.Stderr = os.Stderr
+		if err := shellCmd.Run(); err != nil {
+			slog.Warn("fallback shell exited with error", "error", err)
+		}
 	}
 }
 

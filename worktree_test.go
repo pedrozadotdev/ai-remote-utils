@@ -1020,7 +1020,59 @@ func TestReadConfig_MalformedAruJson(t *testing.T) {
 	}
 }
 
+// resetDetectShell resets the detectShell cache for test isolation.
+func resetDetectShell() {
+	shellDetected = false
+	cachedShell = ""
+}
+
+// TestRunSetupCommands_UsesDetectedShell verifies that runSetupCommands
+// executes commands using detectShell(), not hardcoded bash.
+// It sets SHELL to a custom shell and verifies that shell is invoked.
+func TestRunSetupCommands_UsesDetectedShell(t *testing.T) {
+	resetDetectShell()
+	tmp := t.TempDir()
+	mockDir := filepath.Join(tmp, "mockbin")
+	if err := os.MkdirAll(mockDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a recording mock shell that logs its invocation and then
+	// delegates to the real shell for command execution.
+	// The shell receives: -c <command>
+	recordingShell := filepath.Join(mockDir, "myshell")
+	logFile := filepath.Join(tmp, "shell.log")
+	shellContent := `#!/bin/sh
+printf '%s' myshell >> ` + logFile + `
+exec /bin/sh -c "$2"
+`
+	if err := os.WriteFile(recordingShell, []byte(shellContent), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", mockDir+":/bin:/usr/bin")
+	t.Setenv("SHELL", filepath.Join(mockDir, "myshell"))
+
+	marker := filepath.Join(tmp, "cmd-ran")
+	runSetupCommands(tmp, []string{"touch " + marker})
+
+	// The shell should have been invoked (recorded in logFile)
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("shell log file not found — command may have run with a different shell: %v", err)
+	}
+	if string(data) != "myshell" {
+		t.Errorf("expected shell 'myshell' to be invoked, got %q", string(data))
+	}
+
+	if _, err := os.Stat(marker); os.IsNotExist(err) {
+		t.Error("setup command did not run")
+	}
+}
+
 func TestRunSetupCommands_Order(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	tmp := t.TempDir()
 	marker1 := filepath.Join(tmp, "cmd1-ran")
 	marker2 := filepath.Join(tmp, "cmd2-ran")
@@ -1049,6 +1101,8 @@ func TestRunSetupCommands_Order(t *testing.T) {
 }
 
 func TestRunSetupCommands_ContinuesOnFailure(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	tmp := t.TempDir()
 	marker := filepath.Join(tmp, "second-ran")
 
@@ -1063,12 +1117,16 @@ func TestRunSetupCommands_ContinuesOnFailure(t *testing.T) {
 }
 
 func TestRunSetupCommands_Empty(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	// Should not panic or error
 	runSetupCommands(t.TempDir(), nil)
 	runSetupCommands(t.TempDir(), []string{})
 }
 
 func TestRunTeardownCommands_Order(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	tmp := t.TempDir()
 	marker1 := filepath.Join(tmp, "teardown-cmd1-ran")
 	marker2 := filepath.Join(tmp, "teardown-cmd2-ran")
@@ -1087,11 +1145,15 @@ func TestRunTeardownCommands_Order(t *testing.T) {
 }
 
 func TestRunTeardownCommands_Empty(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	runTeardownCommands(t.TempDir(), nil)
 	runTeardownCommands(t.TempDir(), []string{})
 }
 
 func TestRunTeardownCommands_ContinuesOnFailure(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	tmp := t.TempDir()
 	marker := filepath.Join(tmp, "second-ran")
 
@@ -1332,6 +1394,8 @@ func TestSetupProxy_Wrapper_HandlesAddError(t *testing.T) {
 // TestHandleWorktreeAdd_MultiProxy verifies that handleWorktreeAdd iterates
 // over multiple proxy entries and registers each one in ProxyDB.
 func TestHandleWorktreeAdd_MultiProxy(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	// Override HOME so all state/proxy files go to a temp dir
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
@@ -1409,6 +1473,8 @@ func TestHandleWorktreeAdd_MultiProxy(t *testing.T) {
 // TestHandleWorktreeDel_MultiProxy verifies that handleWorktreeDel iterates
 // over multiple proxy entries and removes each one from ProxyDB.
 func TestHandleWorktreeDel_MultiProxy(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	// Override HOME so all state/proxy files go to a temp dir
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
@@ -1482,6 +1548,8 @@ func TestHandleWorktreeDel_MultiProxy(t *testing.T) {
 // TestHandleWorktreeOpen_MultiProxy verifies that handleWorktreeOpen iterates
 // over multiple proxy entries and re-registers each one in ProxyDB.
 func TestHandleWorktreeOpen_MultiProxy(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	// Override HOME so all state/proxy files go to a temp dir
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
@@ -1699,6 +1767,8 @@ func TestProxyRegistration_SkipEmptyName(t *testing.T) {
 }
 
 func TestBuildTmuxCommand_NoEnv(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	win := TmuxWindow{Command: "npm run dev"}
 	got := buildTmuxCommand(win)
 	want := "trap ':' INT; npm run dev; exec bash"
@@ -1708,6 +1778,8 @@ func TestBuildTmuxCommand_NoEnv(t *testing.T) {
 }
 
 func TestBuildTmuxCommand_WithEnv(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	win := TmuxWindow{
 		Command: "npm run dev",
 		Env:     map[string]string{"PORT": "3000"},
@@ -1721,6 +1793,8 @@ func TestBuildTmuxCommand_WithEnv(t *testing.T) {
 }
 
 func TestBuildTmuxCommand_MultipleEnv(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	win := TmuxWindow{
 		Command: "node server.js",
 		Env:     map[string]string{"PORT": "3000", "HOST": "localhost"},
@@ -1734,6 +1808,8 @@ func TestBuildTmuxCommand_MultipleEnv(t *testing.T) {
 }
 
 func TestBuildTmuxCommand_EmptyCommand(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	win := TmuxWindow{}
 	got := buildTmuxCommand(win)
 	want := "trap ':' INT; exec bash"
@@ -1743,6 +1819,8 @@ func TestBuildTmuxCommand_EmptyCommand(t *testing.T) {
 }
 
 func TestBuildTmuxCommand_OnlyEnv(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	win := TmuxWindow{
 		Env: map[string]string{"PORT": "8080"},
 	}
@@ -1750,6 +1828,50 @@ func TestBuildTmuxCommand_OnlyEnv(t *testing.T) {
 	want := "trap ':' INT; export PORT=\"8080\"; exec bash"
 	if got != want {
 		t.Errorf("buildTmuxCommand() = %q, want %q", got, want)
+	}
+}
+
+// TestBuildSessionArgs_defaultShell verifies that buildSessionArgs includes
+// a session-scoped default-shell set to the detected shell (not bash).
+func TestBuildSessionArgs_defaultShell(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/usr/bin/zsh")
+
+	sock := "/tmp/test.sock"
+	sessionName := "test-session"
+	worktreeDir := "/tmp/worktree"
+	windowName := "dev"
+	cmdStr := "npm run dev"
+
+	args := buildSessionArgs(sock, sessionName, worktreeDir, windowName, cmdStr)
+
+	// Find the default-shell option in the args
+	found := false
+	for i, arg := range args {
+		if arg == "default-shell" && i+1 < len(args) && args[i+1] == "zsh" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("buildSessionArgs() with SHELL=/usr/bin/zsh should set default-shell to zsh\nargs: %v", args)
+	}
+
+	// Should NOT have -g flag before default-shell
+	for i, arg := range args {
+		if arg == "default-shell" {
+			if i > 0 && args[i-1] == "-g" {
+				t.Errorf("default-shell should NOT be preceded by -g (should be session-scoped)\nargs: %v", args)
+			}
+		}
+	}
+
+	// Should NOT have default-command (replaced by default-shell)
+	for _, arg := range args {
+		if arg == "default-command" {
+			t.Errorf("buildSessionArgs() should NOT contain default-command (replaced by default-shell)\nargs: %v", args)
+			break
+		}
 	}
 }
 
@@ -1873,6 +1995,8 @@ func TestSetupTmuxSession_EmptyConfig(t *testing.T) {
 // TestCreateConfigSession_OneWindow verifies that a single-window config
 // issues exactly one new-session call with the right window name.
 func TestCreateConfigSession_OneWindow(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	mockDir := t.TempDir()
 	logPath := createRecordingMockTmux(t, mockDir)
 	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
@@ -1927,6 +2051,8 @@ func TestCreateConfigSession_OneWindow(t *testing.T) {
 // TestCreateConfigSession_MultipleWindows verifies that a 3-window config
 // issues 1 new-session + 2 new-window calls in slice order.
 func TestCreateConfigSession_MultipleWindows(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	mockDir := t.TempDir()
 	logPath := createRecordingMockTmux(t, mockDir)
 	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
@@ -2001,6 +2127,8 @@ func TestCreateConfigSession_MultipleWindows(t *testing.T) {
 // TestCreateConfigSession_DoesNotSelectPi verifies that createConfigSession
 // does not issue select-window calls — window selection is left to the caller.
 func TestCreateConfigSession_DoesNotSelectPi(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	mockDir := t.TempDir()
 	logPath := createRecordingMockTmux(t, mockDir)
 	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
@@ -2032,9 +2160,11 @@ func TestCreateConfigSession_DoesNotSelectPi(t *testing.T) {
 // ── Worktree add/ramdir lifecycle tests (Units 5-7) ────────────────────────
 
 func TestHandleWorktreeAdd_RamDir_SingleEntry(t *testing.T) {
+	resetDetectShell()
 	tmp := t.TempDir()
 	homeDir := filepath.Join(tmp, "home")
 	t.Setenv("HOME", homeDir)
+	t.Setenv("SHELL", "/bin/bash")
 
 	dir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -2091,9 +2221,11 @@ func TestHandleWorktreeAdd_RamDir_SingleEntry(t *testing.T) {
 }
 
 func TestHandleWorktreeAdd_RamDir_NestedPath(t *testing.T) {
+	resetDetectShell()
 	tmp := t.TempDir()
 	homeDir := filepath.Join(tmp, "home")
 	t.Setenv("HOME", homeDir)
+	t.Setenv("SHELL", "/bin/bash")
 
 	dir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -2147,9 +2279,11 @@ func TestHandleWorktreeAdd_RamDir_NestedPath(t *testing.T) {
 }
 
 func TestHandleWorktreeAdd_RamDir_NoConfig(t *testing.T) {
+	resetDetectShell()
 	tmp := t.TempDir()
 	homeDir := filepath.Join(tmp, "home")
 	t.Setenv("HOME", homeDir)
+	t.Setenv("SHELL", "/bin/bash")
 
 	dir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -2203,9 +2337,11 @@ func TestHandleWorktreeAdd_RamDir_NoConfig(t *testing.T) {
 }
 
 func TestHandleWorktreeAdd_RamDir_MultipleEntries(t *testing.T) {
+	resetDetectShell()
 	tmp := t.TempDir()
 	homeDir := filepath.Join(tmp, "home")
 	t.Setenv("HOME", homeDir)
+	t.Setenv("SHELL", "/bin/bash")
 
 	dir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -2263,9 +2399,11 @@ func TestHandleWorktreeAdd_RamDir_MultipleEntries(t *testing.T) {
 // TestHandleWorktreeOpen_RamDir_Noop verifies that open is a no-op when
 // the ramdir directory is an intact tmpfs mount.
 func TestHandleWorktreeOpen_RamDir_Noop(t *testing.T) {
+	resetDetectShell()
 	tmp := t.TempDir()
 	homeDir := filepath.Join(tmp, "home")
 	t.Setenv("HOME", homeDir)
+	t.Setenv("SHELL", "/bin/bash")
 
 	dir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -2320,9 +2458,11 @@ func TestHandleWorktreeOpen_RamDir_Noop(t *testing.T) {
 }
 
 func TestHandleWorktreeOpen_RamDir_Reboot(t *testing.T) {
+	resetDetectShell()
 	tmp := t.TempDir()
 	homeDir := filepath.Join(tmp, "home")
 	t.Setenv("HOME", homeDir)
+	t.Setenv("SHELL", "/bin/bash")
 
 	dir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -2399,9 +2539,11 @@ func TestHandleWorktreeOpen_RamDir_Reboot(t *testing.T) {
 // TestHandleWorktreeOpen_RamDir_MultipleEntries verifies that open handles
 // multiple ramdir entries correctly.
 func TestHandleWorktreeOpen_RamDir_MultipleEntries(t *testing.T) {
+	resetDetectShell()
 	tmp := t.TempDir()
 	homeDir := filepath.Join(tmp, "home")
 	t.Setenv("HOME", homeDir)
+	t.Setenv("SHELL", "/bin/bash")
 
 	dir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -2481,9 +2623,11 @@ func TestHandleWorktreeOpen_RamDir_MultipleEntries(t *testing.T) {
 // ── handleWorktreeDel ramdir cleanup tests (Unit 7) ───────────────────────
 
 func TestHandleWorktreeDel_RamDir_Cleanup(t *testing.T) {
+	resetDetectShell()
 	tmp := t.TempDir()
 	homeDir := filepath.Join(tmp, "home")
 	t.Setenv("HOME", homeDir)
+	t.Setenv("SHELL", "/bin/bash")
 
 	dir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -2760,6 +2904,8 @@ func TestHandleWorktreeList(t *testing.T) {
 }
 
 func TestHandleWorktreeOpen(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	dir := t.TempDir()
 	setupTestRepo(t, dir)
 	createTestBranch(t, dir, "open-test-branch")
@@ -2820,6 +2966,8 @@ func TestHandleWorktreeOpen(t *testing.T) {
 // It verifies that aru worktree open re-uses the port allocated by
 // `aru worktree add` (stored in the state file), rather than allocating a new one.
 func TestHandleWorktreeOpen_WithConfig_F1Regression(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
 
@@ -2938,6 +3086,8 @@ func TestHandleWorktreeOpen_WithConfig_F1Regression(t *testing.T) {
 // `setup_oneshot: true` and a pre-existing marker, setup does NOT run
 // on subsequent opens.
 func TestHandleWorktreeOpen_WithConfig_SetupOneshot(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
 
@@ -3014,6 +3164,8 @@ func TestHandleWorktreeOpen_WithConfig_SetupOneshot(t *testing.T) {
 // when `setup_oneshot: true` is set but the marker does NOT exist, setup runs
 // AND the marker is written for subsequent opens.
 func TestHandleWorktreeOpen_WithConfig_SetupOneshot_RunsFirstTime(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
 
@@ -3089,6 +3241,8 @@ func TestHandleWorktreeOpen_WithConfig_SetupOneshot_RunsFirstTime(t *testing.T) 
 }
 
 func TestHandleWorktreeAdd(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	dir := t.TempDir()
 	setupTestRepo(t, dir)
 	createTestBranch(t, dir, "add-test-branch")
@@ -3135,7 +3289,119 @@ func TestHandleWorktreeAdd(t *testing.T) {
 	})
 }
 
+// ── Shell detection tests (M0) ────────────────────────────────────────────
+
+// createMockShell writes a mock shell binary to dir that exits successfully.
+// Used to simulate available shells in PATH for resolveShell testing.
+func createMockShell(t *testing.T, dir, name string) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	content := `#!/bin/sh
+exit 0
+`
+	if err := os.WriteFile(path, []byte(content), 0755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestResolveShell covers all four code paths of resolveShell.
+func TestResolveShell(t *testing.T) {
+	tests := []struct {
+		name     string
+		shellEnv string
+		setup    func(t *testing.T, dir string) // prepares mock binaries in dir
+		want     string
+		wantExit bool // true if we expect os.Exit(1) via subprocess
+	}{
+		{
+			name:     "fromEnv",
+			shellEnv: "/usr/bin/zsh",
+			setup: func(t *testing.T, dir string) {
+				createMockShell(t, dir, "zsh")
+			},
+			want: "zsh",
+		},
+		{
+			name:     "fallbackToBash",
+			shellEnv: "", // unset
+			setup: func(t *testing.T, dir string) {
+				createMockShell(t, dir, "bash")
+			},
+			want: "bash",
+		},
+		{
+			name:     "fallbackToSh",
+			shellEnv: "", // unset
+			setup: func(t *testing.T, dir string) {
+				createMockShell(t, dir, "sh")
+			},
+			want: "sh",
+		},
+		{
+			name:     "hardError",
+			shellEnv: "", // unset, no shells available
+			setup:    func(t *testing.T, dir string) {},
+			want:     "",
+			wantExit: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.wantExit {
+				// Subprocess isolation pattern: run the test again in a child
+				// process with PATH stripped of all shell binaries.
+				if os.Getenv("RESOLVE_SHELL_HARD_ERROR") == "1" {
+					t.Setenv("SHELL", "")
+					// Set PATH to a dir with no shell binaries
+					t.Setenv("PATH", t.TempDir())
+					got := resolveShell()
+					t.Fatalf("resolveShell() should have exited, got %q", got)
+				}
+
+				cmd := exec.Command(os.Args[0], "-test.run="+t.Name()+"$", "-test.v")
+				cmd.Env = append(os.Environ(), "RESOLVE_SHELL_HARD_ERROR=1")
+				// Strip PATH of all common shells
+				cmd.Env = append(cmd.Env, "PATH="+t.TempDir())
+				out, err := cmd.CombinedOutput()
+
+				// We expect the child to exit with status 1
+				if err == nil {
+					t.Fatalf("expected child process to exit with non-zero status, got success\noutput: %s", string(out))
+				}
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					if exitErr.ExitCode() != 1 {
+						t.Errorf("expected exit code 1, got %d", exitErr.ExitCode())
+					}
+				} else {
+					t.Fatalf("unexpected error type: %v", err)
+				}
+
+				// Verify error message about no shell found
+				output := string(out)
+				if !strings.Contains(output, "no shell available") {
+					t.Errorf("expected error message about no shell, got: %s", output)
+				}
+				return
+			}
+
+			// Normal cases: set up PATH with mock shells
+			mockDir := t.TempDir()
+			tt.setup(t, mockDir)
+			t.Setenv("PATH", mockDir)
+			t.Setenv("SHELL", tt.shellEnv)
+
+			got := resolveShell()
+			if got != tt.want {
+				t.Errorf("resolveShell() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHandleWorktreeDel(t *testing.T) {
+	resetDetectShell()
+	t.Setenv("SHELL", "/bin/bash")
 	dir := t.TempDir()
 	setupTestRepo(t, dir)
 	createTestBranch(t, dir, "del-test-branch")

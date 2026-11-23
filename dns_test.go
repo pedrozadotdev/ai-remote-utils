@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -199,50 +200,110 @@ func TestHasBaseDomain(t *testing.T) {
 	}
 }
 
-func TestHandleDNSQuery_BaseDomain(t *testing.T) {
+// listenUDPPair returns a server conn and a client conn bound to localhost.
+func listenUDPPair(t *testing.T) (*net.UDPConn, *net.UDPConn) {
+	t.Helper()
 	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatalf("server ListenUDP error = %v", err)
 	}
-	defer serverConn.Close()
+	t.Cleanup(func() { serverConn.Close() })
 
 	clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatalf("client ListenUDP error = %v", err)
 	}
-	defer clientConn.Close()
+	t.Cleanup(func() { clientConn.Close() })
 
-	localIP := net.IPv4(10, 1, 2, 3)
+	return serverConn, clientConn
+}
+
+// queryDNS asks handleDNSQuery for name/qtype and returns the response header.
+func queryDNS(t *testing.T, serverConn, clientConn *net.UDPConn, name string, qtype uint16, baseDomain string, db *ProxyDB) dnsHeader {
+	t.Helper()
+	query := buildDNSQuery(name, qtype)
+	handleDNSQuery(serverConn, clientConn.LocalAddr().(*net.UDPAddr), query, net.IPv4(10, 1, 2, 3), baseDomain, db)
+
+	buf := make([]byte, 512)
+	clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err := clientConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("read response for %q (base %q): %v", name, baseDomain, err)
+	}
+	return parseDNSHeader(buf[:n])
+}
+
+func TestHandleDNSQuery_RegisteredOnly(t *testing.T) {
+	serverConn, clientConn := listenUDPPair(t)
+	db := testProxyDB(t, map[string]int{"api": 3000, "a.b": 8080})
+
 	tests := []struct {
 		name        string
+		queryName   string
+		qtype       uint16
 		baseDomain  string
+		db          *ProxyDB
 		wantRcode   uint16
 		wantAnswers uint16
 	}{
-		{"api.example.com", "example.com", dnsRcodeSuccess, 1},
-		{"tmp.example.com", "example.com", dnsRcodeSuccess, 1},
-		{"api.test", "example.com", dnsRcodeRefused, 0},
-		{"api.test", "test", dnsRcodeSuccess, 1},
-		{"example.com", "example.com", dnsRcodeRefused, 0},
+		// Registered proxy names resolve to the interface IP.
+		{"registered name", "api.example.com", 1, "example.com", db, dnsRcodeSuccess, 1},
+		{"registered multi-label name", "a.b.example.com", 1, "example.com", db, dnsRcodeSuccess, 1},
+		{"case-insensitive name", "API.Example.COM", 1, "example.com", db, dnsRcodeSuccess, 1},
+		// The upload host is served by aru itself, so it always resolves.
+		{"upload host", "tmp.example.com", 1, "example.com", db, dnsRcodeSuccess, 1},
+		// Unregistered names under the routing domain must not resolve.
+		{"unregistered name", "nope.example.com", 1, "example.com", db, dnsRcodeNXDOMAIN, 0},
+		{"unregistered multi-label name", "a.c.example.com", 1, "example.com", db, dnsRcodeNXDOMAIN, 0},
+		{"reserved test name", "test.example.com", 1, "example.com", db, dnsRcodeNXDOMAIN, 0},
+		{"empty proxy db", "api.example.com", 1, "example.com", testProxyDB(t, nil), dnsRcodeNXDOMAIN, 0},
+		{"nil proxy db", "api.example.com", 1, "example.com", nil, dnsRcodeNXDOMAIN, 0},
+		{"default base domain", "api.test", 1, "test", db, dnsRcodeSuccess, 1},
+		// Outside the routing domain: REFUSED so clients fall back.
+		{"other suffix", "api.test", 1, "example.com", db, dnsRcodeRefused, 0},
+		{"bare base domain", "example.com", 1, "example.com", db, dnsRcodeRefused, 0},
+		// Non-A queries keep falling back to the secondary DNS.
+		{"aaaa query", "api.example.com", 28, "example.com", db, dnsRcodeRefused, 0},
 	}
 	for _, tc := range tests {
-		query := buildDNSQuery(tc.name, 1)
-		handleDNSQuery(serverConn, clientConn.LocalAddr().(*net.UDPAddr), query, localIP, tc.baseDomain)
+		t.Run(tc.name, func(t *testing.T) {
+			hdr := queryDNS(t, serverConn, clientConn, tc.queryName, tc.qtype, tc.baseDomain, tc.db)
+			if rcode := hdr.Flags & 0x000f; rcode != tc.wantRcode {
+				t.Errorf("%q (base %q): rcode = %d, want %d", tc.queryName, tc.baseDomain, rcode, tc.wantRcode)
+			}
+			if hdr.ANCount != tc.wantAnswers {
+				t.Errorf("%q (base %q): ANCount = %d, want %d", tc.queryName, tc.baseDomain, hdr.ANCount, tc.wantAnswers)
+			}
+		})
+	}
+}
 
-		buf := make([]byte, 512)
-		clientConn.SetReadDeadline(time.Now().Add(time.Second))
-		n, _, err := clientConn.ReadFromUDP(buf)
-		if err != nil {
-			t.Fatalf("read response for %q (base %q): %v", tc.name, tc.baseDomain, err)
-		}
+// TestHandleDNSQuery_HotReload covers a proxy added by the CLI (or a worktree)
+// while the server is running: the entry is persisted to proxies.json, so DNS
+// must pick it up without a restart.
+func TestHandleDNSQuery_HotReload(t *testing.T) {
+	serverConn, clientConn := listenUDPPair(t)
+	db := testProxyDB(t, nil)
+	// Force a stale mtime so Refresh() sees the externally written file even on
+	// filesystems with coarse timestamp granularity.
+	db.mtime = db.mtime.Add(-time.Second)
 
-		hdr := parseDNSHeader(buf[:n])
-		if rcode := hdr.Flags & 0x000f; rcode != tc.wantRcode {
-			t.Errorf("%q (base %q): rcode = %d, want %d", tc.name, tc.baseDomain, rcode, tc.wantRcode)
-		}
-		if hdr.ANCount != tc.wantAnswers {
-			t.Errorf("%q (base %q): ANCount = %d, want %d", tc.name, tc.baseDomain, hdr.ANCount, tc.wantAnswers)
-		}
+	hdr := queryDNS(t, serverConn, clientConn, "late.example.com", 1, "example.com", db)
+	if rcode := hdr.Flags & 0x000f; rcode != dnsRcodeNXDOMAIN {
+		t.Fatalf("before reload: rcode = %d, want NXDOMAIN", rcode)
+	}
+
+	data := []byte(`{"version": 1, "proxies": {"late": 4000}}`)
+	if err := os.WriteFile(db.path, data, 0644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	hdr = queryDNS(t, serverConn, clientConn, "late.example.com", 1, "example.com", db)
+	if rcode := hdr.Flags & 0x000f; rcode != dnsRcodeSuccess {
+		t.Errorf("after reload: rcode = %d, want SUCCESS", rcode)
+	}
+	if hdr.ANCount != 1 {
+		t.Errorf("after reload: ANCount = %d, want 1", hdr.ANCount)
 	}
 }
 

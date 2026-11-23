@@ -140,8 +140,11 @@ func buildDNSResponse(query []byte, qname string, qtype, qclass uint16, question
 }
 
 // StartDNS starts a DNS server on UDP port 53 that responds to A-record queries
-// under baseDomain (e.g. "test" for *.test, or "example.com" for
-// *.example.com) with the exact IP address the query arrived on.
+// for names aru actually serves under baseDomain (e.g. "test" for *.test, or
+// "example.com" for *.example.com) with the exact IP address the query arrived
+// on: the upload host (tmp.<baseDomain>) and every name registered in proxyDB.
+// Unregistered names get NXDOMAIN, so made-up subdomains stop resolving to this
+// machine.
 //
 // It uses IP_PKTINFO control messages (via golang.org/x/net/ipv4) to extract
 // the destination IP from each incoming UDP packet. This is the only reliable
@@ -150,7 +153,7 @@ func buildDNSResponse(query []byte, qname string, qtype, qclass uint16, question
 // addressing and neither subnet matching nor source-IP heuristics work.
 //
 // Returns nil (non-fatal) if binding port 53 fails.
-func StartDNS(ctx context.Context, baseDomain string) error {
+func StartDNS(ctx context.Context, baseDomain string, proxyDB *ProxyDB) error {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 53})
 	if err != nil {
 		slog.Warn("DNS server disabled: cannot bind port 53", "error", err)
@@ -207,7 +210,7 @@ func StartDNS(ctx context.Context, baseDomain string) error {
 				localIP = cm.Dst
 			}
 
-			go handleDNSQuery(conn, srcUDPAddr, query, localIP, baseDomain)
+			go handleDNSQuery(conn, srcUDPAddr, query, localIP, baseDomain, proxyDB)
 		}
 	}()
 
@@ -215,7 +218,7 @@ func StartDNS(ctx context.Context, baseDomain string) error {
 }
 
 // handleDNSQuery processes a single DNS query and sends a response.
-func handleDNSQuery(conn *net.UDPConn, src *net.UDPAddr, query []byte, localIP net.IP, baseDomain string) {
+func handleDNSQuery(conn *net.UDPConn, src *net.UDPAddr, query []byte, localIP net.IP, baseDomain string, proxyDB *ProxyDB) {
 	if len(query) < 12 {
 		slog.Debug("DNS: query too short", "len", len(query))
 		return
@@ -243,7 +246,38 @@ func handleDNSQuery(conn *net.UDPConn, src *net.UDPAddr, query []byte, localIP n
 		return
 	}
 
+	// Only names aru actually serves resolve; anything else under the routing
+	// domain is NXDOMAIN instead of pointing at this machine.
+	if !servesName(qname, proxyDB, baseDomain) {
+		slog.Debug("DNS: name is not registered, answering NXDOMAIN", "name", qname)
+		resp := buildDNSResponse(query, qname, qtype, qclass, consumed, nil, dnsRcodeNXDOMAIN)
+		conn.WriteToUDP(resp, src)
+		return
+	}
+
 	// Respond with the exact IP the query arrived on
 	resp := buildDNSResponse(query, qname, qtype, qclass, consumed, localIP, dnsRcodeSuccess)
 	conn.WriteToUDP(resp, src)
+}
+
+// servesName reports whether aru answers requests for qname itself, mirroring
+// the HTTP virtual host router in server.go: the upload host (tmp.<baseDomain>)
+// and names registered in the proxy DB are served, everything else is not.
+func servesName(qname string, proxyDB *ProxyDB, baseDomain string) bool {
+	if strings.EqualFold(qname, uploadHost(baseDomain)) {
+		return true
+	}
+	if proxyDB == nil {
+		return false
+	}
+	if _, ok := LookupProxy(qname, proxyDB, baseDomain); ok {
+		return true
+	}
+	// Hot-reload: entries added by the CLI (or by `aru worktree add`) while the
+	// server runs only exist on disk. Only pay for the stat on a miss.
+	if proxyDB.Refresh() {
+		_, ok := LookupProxy(qname, proxyDB, baseDomain)
+		return ok
+	}
+	return false
 }

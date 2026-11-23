@@ -78,14 +78,46 @@ if !isTestDomain(qname) {
 
 The client will then fall back to its secondary DNS server configured in `/etc/resolv.conf`.
 
+### 4. Return NXDOMAIN (not REFUSED, not an answer) for names inside your zone that you do not serve
+
+"Not a domain I serve" and "a name inside my zone that does not exist" are different answers and must not be conflated:
+
+- **Outside the served suffix** (`google.com` for a `*.test` zone) → REFUSED, so the client tries another resolver.
+- **Inside the served suffix but not actually served** (`nope.test` when no proxy or upload host owns that name) → NXDOMAIN. You are authoritative for that zone, so a definitive negative answer is the honest one; falling back to a public resolver would only leak the query and still yield no data.
+- **Served name** (`myapp.test` registered in `ProxyDB`, or `tmp.test`) → A record with the interface IP.
+
+Resolving *every* name under the zone (wildcard-style) is a real trap: any made-up subdomain, typo, or probe such as `wpad.test` starts pointing at your machine, and the browser then gets a 404 from the HTTPS listener instead of a clear "cannot resolve". Mirror the HTTP virtual host router: answer only for hosts it would actually serve.
+
+```go
+if !hasBaseDomain(qname, baseDomain) {
+    // Outside our zone — let the client try someone else.
+    resp := buildDNSResponse(query, qname, qtype, qclass, consumed, nil, dnsRcodeRefused)
+    conn.WriteToUDP(resp, src)
+    return
+}
+if !servesName(qname, proxyDB, baseDomain) {
+    // Inside our zone, name does not exist.
+    resp := buildDNSResponse(query, qname, qtype, qclass, consumed, nil, dnsRcodeNXDOMAIN)
+    conn.WriteToUDP(resp, src)
+    return
+}
+```
+
+Because the proxy DB is hot-reloaded from disk, the DNS gate must refresh on a miss before answering NXDOMAIN; otherwise entries added by `aru proxy add` or `aru worktree add` while the server runs would not resolve until a restart.
+
 ## Verification
 
 Test with dig:
 
 ```bash
 # .test domain should resolve
+# (only for names the server actually serves: registered proxies + tmp.test)
 dig @127.0.0.1 myapp.test A +short
 # → 127.0.0.1
+
+# Unregistered name inside the zone should be NXDOMAIN
+dig @127.0.0.1 nope.test A +noall +comments | grep status
+# → status: NXDOMAIN
 
 # Non-.test domain should return REFUSED
 dig @127.0.0.1 google.com A +noall +comments | grep status
@@ -101,3 +133,4 @@ dig @127.0.0.1 myapp.test A
 - **EDNS0 fix**: By only copying the question section (a known number of bytes), we strip any additional sections before adding our own answer. The response contains exactly: header + question + answer.
 - **REFUSED fix**: REFUSED (rcode=5) is defined in RFC 1035 as "The name server refuses to perform the specified operation." Clients interpret this as "try another server," preserving normal DNS resolution for domains we don't serve.
 - **Security**: REFUSED still prevents open-resolver abuse because the server never returns data for arbitrary domains. The response is minimal (header + echoed question, no answer section), so it cannot be used in amplification attacks. This is the same security property as NXDOMAIN.
+- **Zone hygiene**: an authoritative server should distinguish "not my zone" (REFUSED) from "no such name in my zone" (NXDOMAIN). Answering every name in the zone turns the host into a wildcard that resolves typos and probes to itself.

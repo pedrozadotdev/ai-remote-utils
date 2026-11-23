@@ -177,7 +177,7 @@ Examples:
 	StartCleanup(ctx, *uploadDir, 1*time.Hour, 5*time.Minute, 5*time.Minute)
 
 	// --- Start DNS server (non-fatal) ---
-	StartDNS(ctx, baseDomain)
+	StartDNS(ctx, baseDomain, proxyDB)
 
 	// --- Start HTTP redirect server (non-fatal) ---
 	StartRedirect(ctx)

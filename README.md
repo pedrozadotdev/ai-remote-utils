@@ -90,14 +90,16 @@ Open `https://tmp.test/` (or `https://tmp.<domain>/` with a custom certificate) 
 
 ### 🧠 Built-in DNS (port 53)
 
-The built-in DNS server automatically resolves `*.<domain>` domains (`*.test` by default) to your machine's IP:
+The built-in DNS server resolves the `*.<domain>` names that aru actually serves (`*.test` by default) to your machine's IP:
 
+- It answers **only for names that exist**: the upload host (`tmp.<domain>`) and every name registered in the proxy DB (`aru proxy add`, `aru worktree add`). An unregistered name under the routing domain gets **NXDOMAIN** instead of silently pointing at this machine
+- New proxy entries are picked up on the next query for that name — no server restart needed
 - It uses **IP_PKTINFO** socket control messages (via `golang.org/x/net/ipv4`) to extract the **exact destination IP** each DNS query arrived on — no subnet matching, no heuristics
 - This works correctly with **any interface type**: Tailscale (`/32`), LAN (`/24`), Docker bridges, VPNs — the kernel tells us the IP directly
 - Queries from a remote Tailscale client → the server's **Tailscale IP** (e.g., `100.x.x.x`)
 - Queries from local machine → `127.0.0.1`
 - Queries from LAN devices → your machine's LAN IP
-- Non-matching queries (other suffixes) → REFUSED (allows client fallback to secondary DNS)
+- Non-A queries and queries outside the routing domain → REFUSED (allows client fallback to secondary DNS)
 
 If port 53 is already in use (e.g., `systemd-resolved`), the server logs a warning and continues without DNS — use `/etc/hosts` as fallback.
 

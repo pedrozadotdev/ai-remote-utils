@@ -11,7 +11,7 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 | Change cleanup behavior | `cleanup.go` — `cleanupOnce` + `StartCleanup` ; `cleanup_test.go` |
 | Change TLS/cert behavior | `cert.go` — `EnsureCert` (adopts the wildcard suffix from an existing `cert.pem`, self-signs `*.test` otherwise, never rewrites operator files), generation, SAN checks, expiry, persistence; `cert_test.go` |
 | Change the routing domain | `domain.go` — `normalizeBaseDomain`, `hasBaseDomain`, `uploadHost`, `wildcardBaseDomain`; `EnsureCert` returns the suffix that `main.go` passes to `NewServer` and `StartDNS` |
-| Change DNS behavior | `dns.go` — `StartDNS(ctx, baseDomain)`, wire protocol, IP_PKTINFO destination-IP extraction; `dns_test.go` |
+| Change DNS behavior | `dns.go` — `StartDNS(ctx, baseDomain, proxyDB)`, wire protocol, IP_PKTINFO destination-IP extraction, registered-name gate (`servesName`); `dns_test.go` |
 | Change reverse proxy | `proxy.go` — `LookupProxy(host, db, baseDomain)`, `NewReverseProxy`; `proxy_test.go` |
 | Change proxy persistence | `proxydb.go` — ProxyDB (Load/Save/Add/Delete/Get/List/Refresh); `proxydb_test.go` |
 | Change proxy management CLI | `main.go` — `handleProxySubcommand`, `handleProxyAdd`, `handleProxyDel`, `handleProxyList` |
@@ -61,7 +61,7 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 - **Upload size limit**: `http.MaxBytesReader` per request, configurable
 - **Multi-file upload**: iterate `r.MultipartForm.File["files"]`, not `r.FormFile()`
 - **Startup checks**: writability check once at startup, not per-request (avoids TOCTOU)
-- **DNS**: only respond to A queries under the routing domain (`hasBaseDomain(qname, baseDomain)`); any other suffix gets REFUSED (allows client fallback to secondary DNS; still prevents open resolver since no data is returned for arbitrary domains)
+- **DNS**: only respond to A queries under the routing domain (`hasBaseDomain(qname, baseDomain)`) for names aru actually serves — the upload host and names registered in the proxy DB (`servesName`). Unregistered names under the routing domain get NXDOMAIN so made-up subdomains do not resolve to this machine. Any other suffix gets REFUSED (allows client fallback to secondary DNS; still prevents open resolver since no data is returned for arbitrary domains)
 - **Routing domain**: derived from the first wildcard DNS SAN of `<cert-dir>/cert.pem` (`*.example.com` → `example.com`); `test` only when aru generates its own certificate. The suffix flows into `LookupProxy`, `StartDNS`, and `NewServer` — never hardcode `.test` in routing logic.
 - **Certificate ownership**: aru only writes or removes certificate files it generated itself (identified by `certIsAruGenerated`: CN `aru` + Org `aru`). An operator-supplied `cert.pem`/`key.pem` is authoritative and must never be overwritten, deleted, or regenerated — expired or wildcard-less operator certificates are reported as errors instead.
 - **DNS destination-IP discovery**: uses `IP_PKTINFO` via `golang.org/x/net/ipv4` to extract the exact local IP a query arrived on. This is essential for multi-interface setups (Tailscale /32, Docker, VPNs) where subnet matching cannot work. Fallback is `127.0.0.1` when control messages are unavailable.
@@ -120,6 +120,8 @@ When these code patterns appear in a diff, flag for review:
 - Nested guard conditions where outer condition implies inner
 - Proxy Director modifying `r.Host` (should preserve original)
 - DNS responses for hostnames outside the routing domain that return data (ensure REFUSED is not accidentally changed to success or NXDOMAIN)
+- DNS answers for unregistered names under the routing domain (`servesName` check bypassed, inverted, or answered with the interface IP anyway) — every made-up `<anything>.<domain>` would resolve to this machine again
+- `servesName` dropping the proxy DB hot-reload path — proxies added by `aru proxy add` or `aru worktree add` would stop resolving until the server restarts
 - `.test` hardcoded in routing paths (`LookupProxy`, the `server.go` router, `StartDNS`) instead of `baseDomain` / `hasBaseDomain` / `uploadHost`
 - Certificate files deleted or rewritten when they were not aru-generated (`certIsAruGenerated` guard removed or inverted) — would destroy an operator's wildcard certificate
 - `EnsureCert`'s returned suffix ignored in `main.go` (server and DNS then disagree on the domain)

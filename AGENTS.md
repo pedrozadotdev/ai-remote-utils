@@ -9,16 +9,17 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 | Add or modify a Go feature | Edit `.go` files in package `main`. Follow table-driven test pattern. |
 | Change upload behavior | `upload.go` — `UploadHandler.ServeHTTP` + `upload_test.go` |
 | Change cleanup behavior | `cleanup.go` — `cleanupOnce` + `StartCleanup` ; `cleanup_test.go` |
-| Change TLS/cert behavior | `cert.go` — cert generation, SAN detection, expiry, persistence; `cert_test.go` |
-| Change DNS behavior | `dns.go` — `StartDNS`, wire protocol, IP_PKTINFO destination-IP extraction; `dns_test.go` |
-| Change reverse proxy | `proxy.go` — `LookupProxy`, `NewReverseProxy`; `proxy_test.go` |
+| Change TLS/cert behavior | `cert.go` — `EnsureCert` (adopts the wildcard suffix from an existing `cert.pem`, self-signs `*.test` otherwise, never rewrites operator files), generation, SAN checks, expiry, persistence; `cert_test.go` |
+| Change the routing domain | `domain.go` — `normalizeBaseDomain`, `hasBaseDomain`, `uploadHost`, `wildcardBaseDomain`; `EnsureCert` returns the suffix that `main.go` passes to `NewServer` and `StartDNS` |
+| Change DNS behavior | `dns.go` — `StartDNS(ctx, baseDomain)`, wire protocol, IP_PKTINFO destination-IP extraction; `dns_test.go` |
+| Change reverse proxy | `proxy.go` — `LookupProxy(host, db, baseDomain)`, `NewReverseProxy`; `proxy_test.go` |
 | Change proxy persistence | `proxydb.go` — ProxyDB (Load/Save/Add/Delete/Get/List/Refresh); `proxydb_test.go` |
 | Change proxy management CLI | `main.go` — `handleProxySubcommand`, `handleProxyAdd`, `handleProxyDel`, `handleProxyList` |
 | Change aru.json config parsing | `aruconfig.go` — `ParseAruConfig`, `collectPortPlaceholders`, `resolvePlaceholders`, `cloneConfig`; `aruconfig_test.go`. Types: `AruConfig` (ramdir as `[]RamDirConfig`, tmux as `[]TmuxWindowEntry`, proxy as `[]ProxyConfig`), `RamDirConfig` (path+size), `TmuxWindowEntry` (name+command+env), `ProxyConfig`. No `ResolvedConfig` or `flattenConfig` — `AruConfig` used directly. |
 | Change worktree behavior | `worktree.go` — `handleWorktreeAdd`, `handleWorktreeDel`, `handleWorktreeOpen`, `handleWorktreeList`, `readConfig`, `runSetupIfNeeded`, `setupProxy`/`removeProxy`, `resolveShell`/`detectShell`; `worktree_test.go`. RAM dir: `mountRamDirEntry`/`unmountRamDirEntry`/`ramDirSubPath`, `mountRamDir(path, size)`, `isTmpfs`. Tmux config type is `[]TmuxWindowEntry` (ordered slice), not `TmuxConfig` (map). Proxy config is `[]ProxyConfig` (supports multi-proxy). `ResolvedConfig` removed — use `AruConfig.Worktree.*` directly. Shell detection: `resolveShell()` (pure detection, fallback chain) + `detectShell()` (cached, bool+string for test isolation). |
 | Add worktree subcommand | `main.go` — add `"worktree"` case to subcommand switch alongside `"proxy"` |
 | Change HTTP redirect | `redirect.go` — `StartRedirect`; `redirect_test.go` |
-| Add/change routes or middleware | `server.go` — `NewServer` virtual host mux; `server_test.go` |
+| Add/change routes or middleware | `server.go` — `NewServer(maxSize, uploadDir, certPEM, keyPEM, proxyDB, baseDomain)` virtual host mux; `server_test.go` |
 | Change main.go wiring | `main.go` — flag parsing, listener orchestration, signal handling |
 | Update frontend UI | `static/index.html` — single embedded HTML file |
 | Add embedded static asset | `static.go` — embed via `//go:embed static` directive |
@@ -60,7 +61,9 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 - **Upload size limit**: `http.MaxBytesReader` per request, configurable
 - **Multi-file upload**: iterate `r.MultipartForm.File["files"]`, not `r.FormFile()`
 - **Startup checks**: writability check once at startup, not per-request (avoids TOCTOU)
-- **DNS**: only respond to `.test` queries; non-.test gets REFUSED (allows client fallback to secondary DNS; still prevents open resolver since no data is returned for arbitrary domains)
+- **DNS**: only respond to A queries under the routing domain (`hasBaseDomain(qname, baseDomain)`); any other suffix gets REFUSED (allows client fallback to secondary DNS; still prevents open resolver since no data is returned for arbitrary domains)
+- **Routing domain**: derived from the first wildcard DNS SAN of `<cert-dir>/cert.pem` (`*.example.com` → `example.com`); `test` only when aru generates its own certificate. The suffix flows into `LookupProxy`, `StartDNS`, and `NewServer` — never hardcode `.test` in routing logic.
+- **Certificate ownership**: aru only writes or removes certificate files it generated itself (identified by `certIsAruGenerated`: CN `aru` + Org `aru`). An operator-supplied `cert.pem`/`key.pem` is authoritative and must never be overwritten, deleted, or regenerated — expired or wildcard-less operator certificates are reported as errors instead.
 - **DNS destination-IP discovery**: uses `IP_PKTINFO` via `golang.org/x/net/ipv4` to extract the exact local IP a query arrived on. This is essential for multi-interface setups (Tailscale /32, Docker, VPNs) where subnet matching cannot work. Fallback is `127.0.0.1` when control messages are unavailable.
 - **aru.json trust model**: commands in `aru.json` (`worktree.setup`, `worktree.teardown`, `tmux.<window>.command`, `tmux.<window>.env`) run verbatim as the user — equivalent to `Makefile` recipes, `package.json` scripts, or `Dockerfile` `RUN` instructions. Env values ARE shell-escaped (`strconv.Quote`); the `command` field is intentionally NOT escaped. Review `aru.json` changes with the same care as shell scripts. There is no in-process sandbox.
 - **aru.json `setup_oneshot`**: when `true`, setup commands run only once per worktree session. Marker at `~/.aru/state/<project>/<branch>/setup-complete` tracks completion. Use this for non-idempotent setup (DB seeding, schema migrations, one-time init). Marker is removed on `aru worktree del`. To force re-run, delete the marker.
@@ -98,11 +101,11 @@ This file documents conventions, constraints, and skill mappings for AI agents w
 
 ### Reverse proxy conventions
 
-- `LookupProxy` extracts subdomain from `<name>.test` hostnames, looks up name in ProxyDB
+- `LookupProxy` extracts subdomain from `<name>.<baseDomain>` hostnames, looks up name in ProxyDB
 - Case-insensitive matching
 - Strips `:443` port suffix before matching
 - Blocked ports: 53, 80, 443 (prevents loops)
-- Host header preserved as `*.test` (not rewritten to localhost)
+- Host header preserved as `<name>.<baseDomain>` (not rewritten to localhost)
 - `URL.Scheme` → `http`, `URL.Host` → `localhost:<port>` for TCP routing
 - Default transport enables WebSocket upgrades
 - Unknown names return 404 (not a proxy entry), not 502 (upstream unreachable)
@@ -116,7 +119,11 @@ When these code patterns appear in a diff, flag for review:
 - Startup checks repeated inside per-request handlers
 - Nested guard conditions where outer condition implies inner
 - Proxy Director modifying `r.Host` (should preserve original)
-- DNS responses for non-`.test` domains that return data (ensure REFUSED is not accidentally changed to success or NXDOMAIN)
+- DNS responses for hostnames outside the routing domain that return data (ensure REFUSED is not accidentally changed to success or NXDOMAIN)
+- `.test` hardcoded in routing paths (`LookupProxy`, the `server.go` router, `StartDNS`) instead of `baseDomain` / `hasBaseDomain` / `uploadHost`
+- Certificate files deleted or rewritten when they were not aru-generated (`certIsAruGenerated` guard removed or inverted) — would destroy an operator's wildcard certificate
+- `EnsureCert`'s returned suffix ignored in `main.go` (server and DNS then disagree on the domain)
+- Wildcard suffix taken from a SAN that is not the first wildcard, or taken from a non-wildcard SAN (must stay: first `*.` SAN, `test` fallback only when aru generates the pair)
 - `blockedProxyPorts` bypass via JSON file edit (LoadProxyDB and Refresh must validate ports)
 - ProxyDB name validation bypass — `LookupProxy` must block reserved names (`tmp`, `test`) alongside `validateName`
 - `os.Exit()` inside functions called from goroutines (cannot be recovered)

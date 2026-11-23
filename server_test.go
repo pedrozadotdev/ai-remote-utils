@@ -54,12 +54,19 @@ func doPost(t *testing.T, addr, host, path string, contentType string, body io.R
 	return resp
 }
 
-// setupTestServer creates a test server with an empty ProxyDB.
-// Returns the address, server, cert PEM, key PEM, and a writeable ProxyDB.
+// setupTestServer creates a test server with an empty ProxyDB on the default
+// .test suffix. Returns the address, server, cert PEM, key PEM, and a writeable
+// ProxyDB.
 func setupTestServer(t *testing.T) (string, *Server, []byte, []byte, *ProxyDB) {
 	t.Helper()
+	return setupTestServerWithDomain(t, "test")
+}
+
+// setupTestServerWithDomain creates a test server that routes on baseDomain.
+func setupTestServerWithDomain(t *testing.T, baseDomain string) (string, *Server, []byte, []byte, *ProxyDB) {
+	t.Helper()
 	certDir := t.TempDir()
-	if err := EnsureCert(certDir); err != nil {
+	if _, err := EnsureCert(certDir); err != nil {
 		t.Fatalf("EnsureCert error = %v", err)
 	}
 	certPEM, err := os.ReadFile(filepath.Join(certDir, "cert.pem"))
@@ -77,7 +84,7 @@ func setupTestServer(t *testing.T) (string, *Server, []byte, []byte, *ProxyDB) {
 		t.Fatalf("LoadProxyDB error = %v", err)
 	}
 
-	srv := NewServer(1024*1024, t.TempDir(), certPEM, keyPEM, proxyDB)
+	srv := NewServer(1024*1024, t.TempDir(), certPEM, keyPEM, proxyDB, baseDomain)
 	addr := startServer(t, srv)
 	return addr, srv, certPEM, keyPEM, proxyDB
 }
@@ -313,6 +320,51 @@ func TestServer_ProxyRoute_WithPortSuffix(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected 200 for myapp.test with port suffix, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_CustomDomain(t *testing.T) {
+	// Start an upstream server for the proxy entry
+	upstream := http.Server{Addr: "127.0.0.1:0"}
+	upstream.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("upstream-ok"))
+	})
+	upstreamListener, err := net.Listen("tcp", upstream.Addr)
+	if err != nil {
+		t.Fatalf("upstream listen error: %v", err)
+	}
+	upstream.Addr = upstreamListener.Addr().String()
+	go upstream.Serve(upstreamListener)
+	defer upstream.Close()
+	time.Sleep(20 * time.Millisecond)
+
+	addr, srv, _, _, proxyDB := setupTestServerWithDomain(t, "example.com")
+	defer srv.Close()
+
+	_, portStr, _ := net.SplitHostPort(upstream.Addr)
+	upstreamPort, _ := strconv.Atoi(portStr)
+	if err := proxyDB.Add("myapp", upstreamPort); err != nil {
+		t.Fatalf("proxyDB.Add error = %v", err)
+	}
+
+	tests := []struct {
+		host string
+		want int
+		desc string
+	}{
+		{"myapp.example.com", http.StatusOK, "proxy entry under the certificate suffix"},
+		{"myapp.test", http.StatusNotFound, "default suffix no longer routes"},
+		{"tmp.example.com", http.StatusOK, "upload host follows the suffix"},
+		{"tmp.test", http.StatusNotFound, "default upload host no longer routes"},
+		{"example.com", http.StatusNotFound, "bare suffix is not a route"},
+	}
+	for _, tc := range tests {
+		resp := doGet(t, addr, tc.host, "/")
+		if resp.StatusCode != tc.want {
+			t.Errorf("GET %s = %d, want %d [%s]", tc.host, resp.StatusCode, tc.want, tc.desc)
+		}
+		resp.Body.Close()
 	}
 }
 

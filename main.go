@@ -39,9 +39,11 @@ Server Flags:
 		flag.PrintDefaults()
 		fmt.Fprintf(w, `
 Proxy Commands:
-  add --name=X --port=Y    Add a reverse proxy entry for <name>.test -> localhost:Y
+  add --name=X --port=Y    Add a reverse proxy entry for <name>.<domain> -> localhost:Y
   del --name=X             Remove a proxy entry
   list                     List all proxy entries
+
+  <domain> comes from the wildcard SAN of cert.pem in the cert dir (default: test)
 
 Worktree Commands:
   add <branch>     Create a git worktree for <branch>, set up tmux, and attach
@@ -138,11 +140,13 @@ Examples:
 		os.Exit(1)
 	}
 
-	// --- Ensure certificate ---
-	if err := EnsureCert(*certDir); err != nil {
+	// --- Ensure certificate and resolve the routing domain ---
+	baseDomain, err := EnsureCert(*certDir)
+	if err != nil {
 		slog.Error("failed to ensure certificate", "error", err)
 		os.Exit(1)
 	}
+	slog.Info("routing domain resolved", "domain", baseDomain, "upload_host", uploadHost(baseDomain))
 
 	// Read cert files
 	certPEM, err := os.ReadFile(filepath.Join(*certDir, "cert.pem"))
@@ -173,13 +177,13 @@ Examples:
 	StartCleanup(ctx, *uploadDir, 1*time.Hour, 5*time.Minute, 5*time.Minute)
 
 	// --- Start DNS server (non-fatal) ---
-	StartDNS(ctx)
+	StartDNS(ctx, baseDomain)
 
 	// --- Start HTTP redirect server (non-fatal) ---
 	StartRedirect(ctx)
 
 	// --- Create HTTPS server ---
-	srv := NewServer(int64(*maxSize), *uploadDir, certPEM, keyPEM, proxyDB)
+	srv := NewServer(int64(*maxSize), *uploadDir, certPEM, keyPEM, proxyDB, baseDomain)
 	if srv == nil {
 		slog.Error("failed to create server")
 		os.Exit(1)
@@ -209,7 +213,7 @@ Examples:
 		"upload_dir", *uploadDir,
 	)
 
-	fmt.Printf("Open https://tmp.test in your browser (requires DNS)\n")
+	fmt.Printf("Open https://%s in your browser (requires DNS)\n", uploadHost(baseDomain))
 
 	go func() {
 		<-ctx.Done()

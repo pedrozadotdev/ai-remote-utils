@@ -86,11 +86,6 @@ func parseDNSQuestion(data []byte) (qname string, qtype, qclass uint16, consumed
 	return strings.Join(labels, "."), qtype, qclass, consumed, nil
 }
 
-// isTestDomain returns true if qname ends with ".test" (case-insensitive).
-func isTestDomain(qname string) bool {
-	return strings.HasSuffix(strings.ToLower(qname), ".test") && strings.Contains(qname, ".")
-}
-
 // buildDNSResponse constructs a DNS response packet.
 // questionLen is the number of bytes consumed by the question section from query[12:].
 // If ip is nil (NXDOMAIN), no answer section is included.
@@ -144,8 +139,9 @@ func buildDNSResponse(query []byte, qname string, qtype, qclass uint16, question
 	return buf
 }
 
-// StartDNS starts a DNS server on UDP port 53 that responds to *.test A-record
-// queries with the exact IP address the query arrived on.
+// StartDNS starts a DNS server on UDP port 53 that responds to A-record queries
+// under baseDomain (e.g. "test" for *.test, or "example.com" for
+// *.example.com) with the exact IP address the query arrived on.
 //
 // It uses IP_PKTINFO control messages (via golang.org/x/net/ipv4) to extract
 // the destination IP from each incoming UDP packet. This is the only reliable
@@ -154,7 +150,7 @@ func buildDNSResponse(query []byte, qname string, qtype, qclass uint16, question
 // addressing and neither subnet matching nor source-IP heuristics work.
 //
 // Returns nil (non-fatal) if binding port 53 fails.
-func StartDNS(ctx context.Context) error {
+func StartDNS(ctx context.Context, baseDomain string) error {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 53})
 	if err != nil {
 		slog.Warn("DNS server disabled: cannot bind port 53", "error", err)
@@ -211,7 +207,7 @@ func StartDNS(ctx context.Context) error {
 				localIP = cm.Dst
 			}
 
-			go handleDNSQuery(conn, srcUDPAddr, query, localIP)
+			go handleDNSQuery(conn, srcUDPAddr, query, localIP, baseDomain)
 		}
 	}()
 
@@ -219,7 +215,7 @@ func StartDNS(ctx context.Context) error {
 }
 
 // handleDNSQuery processes a single DNS query and sends a response.
-func handleDNSQuery(conn *net.UDPConn, src *net.UDPAddr, query []byte, localIP net.IP) {
+func handleDNSQuery(conn *net.UDPConn, src *net.UDPAddr, query []byte, localIP net.IP, baseDomain string) {
 	if len(query) < 12 {
 		slog.Debug("DNS: query too short", "len", len(query))
 		return
@@ -233,7 +229,7 @@ func handleDNSQuery(conn *net.UDPConn, src *net.UDPAddr, query []byte, localIP n
 
 	slog.Debug("DNS query", "name", qname, "type", qtype, "src", src.IP, "local", localIP)
 
-	// Only respond to A-record queries for *.test domains
+	// Only respond to A-record queries under the routing domain
 	// Non-matching queries get REFUSED so the client falls back to its secondary DNS
 	if qtype != 1 { // A record
 		resp := buildDNSResponse(query, qname, qtype, qclass, consumed, nil, dnsRcodeRefused)
@@ -241,7 +237,7 @@ func handleDNSQuery(conn *net.UDPConn, src *net.UDPAddr, query []byte, localIP n
 		return
 	}
 
-	if !isTestDomain(qname) {
+	if !hasBaseDomain(qname, baseDomain) {
 		resp := buildDNSResponse(query, qname, qtype, qclass, consumed, nil, dnsRcodeRefused)
 		conn.WriteToUDP(resp, src)
 		return

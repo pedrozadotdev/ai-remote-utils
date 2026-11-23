@@ -20,10 +20,11 @@ type Server struct {
 }
 
 // NewServer creates a new Server with virtual host routing.
-// - tmp.test → upload handler + static files (with security headers)
-// - <name>.test → reverse proxy via ProxyDB (without security headers)
-// - anything else → 404
-func NewServer(maxSize int64, uploadDir string, certPEM, keyPEM []byte, proxyDB *ProxyDB) *Server {
+// baseDomain is the suffix aru routes on (from EnsureCert):
+//   - tmp.<baseDomain> → upload handler + static files (with security headers)
+//   - <name>.<baseDomain> → reverse proxy via ProxyDB (without security headers)
+//   - anything else → 404
+func NewServer(maxSize int64, uploadDir string, certPEM, keyPEM []byte, proxyDB *ProxyDB, baseDomain string) *Server {
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		slog.Error("failed to parse TLS certificate", "error", err)
@@ -69,7 +70,7 @@ func NewServer(maxSize int64, uploadDir string, certPEM, keyPEM []byte, proxyDB 
 			proxyDB.Refresh()
 		}
 
-		port, ok := LookupProxy(r.Host, proxyDB)
+		port, ok := LookupProxy(r.Host, proxyDB, baseDomain)
 		if !ok {
 			http.Error(w, "Not Found: unknown proxy target", http.StatusNotFound)
 			return
@@ -92,9 +93,9 @@ func NewServer(maxSize int64, uploadDir string, certPEM, keyPEM []byte, proxyDB 
 		host = strings.ToLower(host)
 
 		switch {
-		case host == "tmp.test":
+		case host == uploadHost(baseDomain):
 			securedUpload.ServeHTTP(w, r)
-		case strings.HasSuffix(host, ".test"):
+		case hasBaseDomain(host, baseDomain):
 			proxyHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)

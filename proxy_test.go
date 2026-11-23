@@ -15,12 +15,12 @@ import (
 func TestLookupProxy_Found(t *testing.T) {
 	db := testProxyDB(t, map[string]int{"myapp": 3000, "api": 8080})
 
-	port, ok := LookupProxy("myapp.test", db)
+	port, ok := LookupProxy("myapp.test", db, "test")
 	if !ok || port != 3000 {
 		t.Errorf("LookupProxy('myapp.test') = (%d, %v), want (3000, true)", port, ok)
 	}
 
-	port, ok = LookupProxy("api.test", db)
+	port, ok = LookupProxy("api.test", db, "test")
 	if !ok || port != 8080 {
 		t.Errorf("LookupProxy('api.test') = (%d, %v), want (8080, true)", port, ok)
 	}
@@ -29,7 +29,7 @@ func TestLookupProxy_Found(t *testing.T) {
 func TestLookupProxy_NotFound(t *testing.T) {
 	db := testProxyDB(t, map[string]int{"myapp": 3000})
 
-	port, ok := LookupProxy("unknown.test", db)
+	port, ok := LookupProxy("unknown.test", db, "test")
 	if ok || port != 0 {
 		t.Errorf("LookupProxy('unknown.test') = (%d, %v), want (0, false)", port, ok)
 	}
@@ -38,7 +38,7 @@ func TestLookupProxy_NotFound(t *testing.T) {
 func TestLookupProxy_ReservedTmp(t *testing.T) {
 	db := testProxyDB(t, map[string]int{"myapp": 3000})
 
-	port, ok := LookupProxy("tmp.test", db)
+	port, ok := LookupProxy("tmp.test", db, "test")
 	if ok || port != 0 {
 		t.Errorf("LookupProxy('tmp.test') = (%d, %v), want (0, false)", port, ok)
 	}
@@ -47,7 +47,7 @@ func TestLookupProxy_ReservedTmp(t *testing.T) {
 func TestLookupProxy_StripsPortSuffix(t *testing.T) {
 	db := testProxyDB(t, map[string]int{"myapp": 3000})
 
-	port, ok := LookupProxy("myapp.test:443", db)
+	port, ok := LookupProxy("myapp.test:443", db, "test")
 	if !ok || port != 3000 {
 		t.Errorf("LookupProxy('myapp.test:443') = (%d, %v), want (3000, true)", port, ok)
 	}
@@ -67,7 +67,7 @@ func TestLookupProxy_NoSubdomain(t *testing.T) {
 		{"example.com", "non-.test domain"},
 	}
 	for _, tc := range tests {
-		port, ok := LookupProxy(tc.host, db)
+		port, ok := LookupProxy(tc.host, db, "test")
 		if ok || port != 0 {
 			t.Errorf("LookupProxy(%q) = (%d, %v), want (0, false) [%s]",
 				tc.host, port, ok, tc.desc)
@@ -79,12 +79,12 @@ func TestLookupProxy_MultipleLabels(t *testing.T) {
 	db := testProxyDB(t, map[string]int{"snake.aru-test": 3000, "foo.bar": 8080})
 
 	// Multi-label subdomains (e.g., "snake.aru-test.test") are supported
-	port, ok := LookupProxy("snake.aru-test.test", db)
+	port, ok := LookupProxy("snake.aru-test.test", db, "test")
 	if !ok || port != 3000 {
 		t.Errorf("LookupProxy('snake.aru-test.test') = (%d, %v), want (3000, true)", port, ok)
 	}
 
-	port, ok = LookupProxy("FOO.BAR.TEST", db)
+	port, ok = LookupProxy("FOO.BAR.TEST", db, "test")
 	if !ok || port != 8080 {
 		t.Errorf("LookupProxy('FOO.BAR.TEST') = (%d, %v), want (8080, true)", port, ok)
 	}
@@ -94,19 +94,19 @@ func TestLookupProxy_CaseInsensitive(t *testing.T) {
 	db := testProxyDB(t, map[string]int{"myapp": 3000})
 
 	// Lookup is case-insensitive on the hostname
-	port, ok := LookupProxy("MyApp.test", db)
+	port, ok := LookupProxy("MyApp.test", db, "test")
 	if !ok || port != 3000 {
 		t.Errorf("LookupProxy('MyApp.test') = (%d, %v), want (3000, true)", port, ok)
 	}
 
-	port, ok = LookupProxy("MYAPP.TEST", db)
+	port, ok = LookupProxy("MYAPP.TEST", db, "test")
 	if !ok || port != 3000 {
 		t.Errorf("LookupProxy('MYAPP.TEST') = (%d, %v), want (3000, true)", port, ok)
 	}
 }
 
 func TestLookupProxy_NilDB(t *testing.T) {
-	port, ok := LookupProxy("myapp.test", nil)
+	port, ok := LookupProxy("myapp.test", nil, "test")
 	if ok || port != 0 {
 		t.Errorf("LookupProxy with nil db = (%d, %v), want (0, false)", port, ok)
 	}
@@ -115,9 +115,39 @@ func TestLookupProxy_NilDB(t *testing.T) {
 func TestLookupProxy_EmptyDB(t *testing.T) {
 	db := testProxyDB(t, nil)
 
-	port, ok := LookupProxy("anything.test", db)
+	port, ok := LookupProxy("anything.test", db, "test")
 	if ok || port != 0 {
 		t.Errorf("LookupProxy with empty db = (%d, %v), want (0, false)", port, ok)
+	}
+}
+
+func TestLookupProxy_CustomBaseDomain(t *testing.T) {
+	db := testProxyDB(t, map[string]int{"myapp": 3000})
+
+	// Names under the certificate suffix resolve
+	if port, ok := LookupProxy("myapp.example.com", db, "example.com"); !ok || port != 3000 {
+		t.Errorf("LookupProxy('myapp.example.com') = (%d, %v), want (3000, true)", port, ok)
+	}
+	if port, ok := LookupProxy("MYAPP.Example.COM:443", db, "example.com"); !ok || port != 3000 {
+		t.Errorf("LookupProxy('MYAPP.Example.COM:443') = (%d, %v), want (3000, true)", port, ok)
+	}
+
+	// The default .test suffix stops routing once the domain changes
+	if port, ok := LookupProxy("myapp.test", db, "example.com"); ok || port != 0 {
+		t.Errorf("LookupProxy('myapp.test') with example.com = (%d, %v), want (0, false)", port, ok)
+	}
+
+	// The upload host stays reserved under the custom suffix
+	if port, ok := LookupProxy("tmp.example.com", db, "example.com"); ok || port != 0 {
+		t.Errorf("LookupProxy('tmp.example.com') = (%d, %v), want (0, false)", port, ok)
+	}
+}
+
+func TestLookupProxy_EmptyBaseDomain(t *testing.T) {
+	db := testProxyDB(t, map[string]int{"myapp": 3000})
+
+	if port, ok := LookupProxy("myapp.test", db, ""); ok || port != 0 {
+		t.Errorf("LookupProxy with empty base domain = (%d, %v), want (0, false)", port, ok)
 	}
 }
 

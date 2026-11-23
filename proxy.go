@@ -19,11 +19,15 @@ var blockedProxyPorts = map[int]bool{
 }
 
 // LookupProxy looks up a named proxy by hostname. It extracts the subdomain
-// from a hostname like "myapp.test" or "myapp.test:443", converts to lowercase,
-// and looks up the name in the given ProxyDB. Returns the port and true if found.
-// Returns false for reserved names like "tmp.test", non-.test domains, etc.
-func LookupProxy(host string, db *ProxyDB) (int, bool) {
-	if db == nil {
+// from a hostname like "myapp.test" or "myapp.example.com:443", converts to
+// lowercase, and looks up the name in the given ProxyDB. baseDomain is the
+// suffix aru routes on ("test" for the generated certificate, or the wildcard
+// suffix adopted from a custom certificate). Returns the port and true if found.
+// Returns false for reserved names like "tmp.test", hosts outside baseDomain, or
+// a nil/empty database.
+func LookupProxy(host string, db *ProxyDB, baseDomain string) (int, bool) {
+	base := normalizeBaseDomain(baseDomain)
+	if db == nil || base == "" {
 		return 0, false
 	}
 
@@ -38,20 +42,21 @@ func LookupProxy(host string, db *ProxyDB) (int, bool) {
 	// Convert to lowercase for case-insensitive matching
 	host = strings.ToLower(host)
 
-	// Must end with ".test"
-	if !strings.HasSuffix(host, ".test") {
+	// Must be a subdomain of the routing domain
+	suffix := "." + base
+	if !strings.HasSuffix(host, suffix) {
 		return 0, false
 	}
 
-	// Remove ".test" suffix
-	name := strings.TrimSuffix(host, ".test")
+	// Remove the domain suffix
+	name := strings.TrimSuffix(host, suffix)
 
 	// Must not be empty
 	if name == "" {
 		return 0, false
 	}
 
-	// "tmp" and "test" are reserved
+	// "tmp" (upload host) and "test" are reserved
 	if name == "tmp" || name == "test" {
 		return 0, false
 	}
@@ -62,7 +67,7 @@ func LookupProxy(host string, db *ProxyDB) (int, bool) {
 }
 
 // NewReverseProxy creates an httputil.ReverseProxy that forwards requests to
-// localhost:<port>. The Host header is preserved as the original *.test hostname
+// localhost:<port>. The Host header is preserved as the original proxy hostname
 // (not rewritten to localhost). WebSocket upgrades work via the default transport.
 func NewReverseProxy(port int) *httputil.ReverseProxy {
 	target := &url.URL{
@@ -72,7 +77,7 @@ func NewReverseProxy(port int) *httputil.ReverseProxy {
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(r *http.Request) {
-			// Preserve original Host header (upstream sees *.test hostname)
+			// Preserve original Host header (upstream sees the proxy hostname)
 			// Only rewrite the URL target to localhost:<port>
 			r.URL.Scheme = target.Scheme
 			r.URL.Host = target.Host

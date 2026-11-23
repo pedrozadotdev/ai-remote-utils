@@ -1,8 +1,12 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
@@ -186,10 +190,13 @@ func TestEnsureCert_CreatesAndLoads(t *testing.T) {
 	certPath := filepath.Join(certDir, "cert.pem")
 	keyPath := filepath.Join(certDir, "key.pem")
 
-	// First call should generate
-	err := EnsureCert(certDir)
+	// First call should generate and report the default suffix
+	baseDomain, err := EnsureCert(certDir)
 	if err != nil {
 		t.Fatalf("EnsureCert() error = %v", err)
+	}
+	if baseDomain != "test" {
+		t.Errorf("EnsureCert() baseDomain = %q, want %q", baseDomain, "test")
 	}
 	if _, err := os.Stat(certPath); os.IsNotExist(err) {
 		t.Fatal("cert.pem not created")
@@ -199,8 +206,7 @@ func TestEnsureCert_CreatesAndLoads(t *testing.T) {
 	}
 
 	// Second call should reuse without error
-	err = EnsureCert(certDir)
-	if err != nil {
+	if _, err = EnsureCert(certDir); err != nil {
 		t.Fatalf("EnsureCert() second call error = %v", err)
 	}
 }
@@ -210,15 +216,13 @@ func TestEnsureCert_ReusesExisting(t *testing.T) {
 	certPath := filepath.Join(certDir, "cert.pem")
 
 	// Generate first cert
-	err := EnsureCert(certDir)
-	if err != nil {
+	if _, err := EnsureCert(certDir); err != nil {
 		t.Fatalf("EnsureCert() error = %v", err)
 	}
 	firstContent, _ := os.ReadFile(certPath)
 
 	// Call again — should not regenerate
-	err = EnsureCert(certDir)
-	if err != nil {
+	if _, err := EnsureCert(certDir); err != nil {
 		t.Fatalf("EnsureCert() second call error = %v", err)
 	}
 	secondContent, _ := os.ReadFile(certPath)
@@ -232,27 +236,21 @@ func TestEnsureCert_RegeneratesOnExpiry(t *testing.T) {
 	certDir := t.TempDir()
 	certPath := filepath.Join(certDir, "cert.pem")
 
-	// Write an expired cert
-	expiredPEM, _, err := generateShortLivedCert(-1 * time.Hour)
+	// Write an expired cert together with its matching key
+	expiredPEM, expiredKeyPEM, err := generateShortLivedCert(-1 * time.Hour)
 	if err != nil {
 		t.Fatalf("generateShortLivedCert() error = %v", err)
 	}
 	if err := os.WriteFile(certPath, expiredPEM, 0644); err != nil {
 		t.Fatalf("WriteFile error = %v", err)
 	}
-	// Write a corresponding key (simplified: reuse the test key)
-	_, keyPEM, err := generateShortLivedCert(-1 * time.Hour)
-	if err != nil {
-		t.Fatalf("generateShortLivedCert() error = %v", err)
-	}
 	keyPath := filepath.Join(certDir, "key.pem")
-	if err := os.WriteFile(keyPath, keyPEM, 0644); err != nil {
+	if err := os.WriteFile(keyPath, expiredKeyPEM, 0600); err != nil {
 		t.Fatalf("WriteFile error = %v", err)
 	}
 
 	// EnsureCert should regenerate
-	err = EnsureCert(certDir)
-	if err != nil {
+	if _, err := EnsureCert(certDir); err != nil {
 		t.Fatalf("EnsureCert() error = %v", err)
 	}
 	newContent, _ := os.ReadFile(certPath)
@@ -268,9 +266,156 @@ func TestEnsureCert_UnwritableDir(t *testing.T) {
 	certDir := filepath.Join(t.TempDir(), "nonexistent")
 
 	// Non-existent parent dir should fail
-	err := EnsureCert(certDir)
-	if err == nil {
+	if _, err := EnsureCert(certDir); err == nil {
 		t.Error("EnsureCert() expected error for unwritable dir, got nil")
+	}
+}
+
+// writeCertPair writes a PEM certificate/key pair into dir.
+func writeCertPair(t *testing.T, dir string, certPEM, keyPEM []byte) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "cert.pem"), certPEM, 0644); err != nil {
+		t.Fatalf("write cert.pem: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "key.pem"), keyPEM, 0600); err != nil {
+		t.Fatalf("write key.pem: %v", err)
+	}
+}
+
+// testCertPair mints a self-signed certificate with the given DNS SANs.
+func testCertPair(t *testing.T, dnsNames []string, validity time.Duration) (certPEM, keyPEM []byte) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey error = %v", err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatalf("rand.Int error = %v", err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{Organization: []string{"acme"}, CommonName: "wildcard"},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(validity),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     dnsNames,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate error = %v", err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("x509.MarshalPKCS8PrivateKey error = %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+}
+
+func TestEnsureCert_AdoptsCustomWildcardDomain(t *testing.T) {
+	certDir := t.TempDir()
+	certPEM, keyPEM := testCertPair(t, []string{"*.example.com"}, 365*24*time.Hour)
+	writeCertPair(t, certDir, certPEM, keyPEM)
+
+	baseDomain, err := EnsureCert(certDir)
+	if err != nil {
+		t.Fatalf("EnsureCert() error = %v", err)
+	}
+	if baseDomain != "example.com" {
+		t.Errorf("baseDomain = %q, want %q", baseDomain, "example.com")
+	}
+
+	// The operator's files must be left untouched
+	got, err := os.ReadFile(filepath.Join(certDir, "cert.pem"))
+	if err != nil {
+		t.Fatalf("read cert.pem: %v", err)
+	}
+	if string(got) != string(certPEM) {
+		t.Error("EnsureCert() rewrote a user-supplied certificate")
+	}
+}
+
+func TestEnsureCert_UsesFirstWildcardSAN(t *testing.T) {
+	certDir := t.TempDir()
+	certPEM, keyPEM := testCertPair(t, []string{"*.example.com", "*.lab.internal"}, 365*24*time.Hour)
+	writeCertPair(t, certDir, certPEM, keyPEM)
+
+	baseDomain, err := EnsureCert(certDir)
+	if err != nil {
+		t.Fatalf("EnsureCert() error = %v", err)
+	}
+	if baseDomain != "example.com" {
+		t.Errorf("baseDomain = %q, want first wildcard %q", baseDomain, "example.com")
+	}
+}
+
+func TestEnsureCert_CustomCertWithoutWildcardFails(t *testing.T) {
+	certDir := t.TempDir()
+	certPEM, keyPEM := testCertPair(t, []string{"aru.local"}, 365*24*time.Hour)
+	writeCertPair(t, certDir, certPEM, keyPEM)
+
+	if _, err := EnsureCert(certDir); err == nil {
+		t.Fatal("EnsureCert() = nil error for a certificate without a wildcard SAN")
+	}
+
+	got, err := os.ReadFile(filepath.Join(certDir, "cert.pem"))
+	if err != nil {
+		t.Fatalf("read cert.pem: %v", err)
+	}
+	if string(got) != string(certPEM) {
+		t.Error("EnsureCert() overwrote a certificate it did not generate")
+	}
+}
+
+func TestEnsureCert_ExpiredCustomCertIsPreserved(t *testing.T) {
+	certDir := t.TempDir()
+	certPEM, keyPEM := testCertPair(t, []string{"*.example.com"}, -time.Hour)
+	writeCertPair(t, certDir, certPEM, keyPEM)
+
+	if _, err := EnsureCert(certDir); err == nil {
+		t.Fatal("EnsureCert() = nil error for an expired user certificate")
+	}
+
+	got, err := os.ReadFile(filepath.Join(certDir, "cert.pem"))
+	if err != nil {
+		t.Fatalf("read cert.pem: %v", err)
+	}
+	if string(got) != string(certPEM) {
+		t.Error("EnsureCert() replaced an expired certificate it did not generate")
+	}
+}
+
+func TestEnsureCert_CertWithoutKeyFails(t *testing.T) {
+	certDir := t.TempDir()
+	certPEM, _ := testCertPair(t, []string{"*.example.com"}, 365*24*time.Hour)
+	if err := os.WriteFile(filepath.Join(certDir, "cert.pem"), certPEM, 0644); err != nil {
+		t.Fatalf("write cert.pem: %v", err)
+	}
+
+	if _, err := EnsureCert(certDir); err == nil {
+		t.Fatal("EnsureCert() = nil error for cert.pem without key.pem")
+	}
+
+	got, err := os.ReadFile(filepath.Join(certDir, "cert.pem"))
+	if err != nil {
+		t.Fatalf("read cert.pem: %v", err)
+	}
+	if string(got) != string(certPEM) {
+		t.Error("EnsureCert() overwrote cert.pem although key.pem was missing")
+	}
+}
+
+func TestEnsureCert_MismatchedPairFails(t *testing.T) {
+	certDir := t.TempDir()
+	certPEM, _ := testCertPair(t, []string{"*.example.com"}, 365*24*time.Hour)
+	_, otherKeyPEM := testCertPair(t, []string{"*.example.com"}, 365*24*time.Hour)
+	writeCertPair(t, certDir, certPEM, otherKeyPEM)
+
+	if _, err := EnsureCert(certDir); err == nil {
+		t.Fatal("EnsureCert() = nil error for a mismatched certificate/key pair")
 	}
 }
 

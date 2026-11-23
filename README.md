@@ -2,9 +2,10 @@
 
 A single Go binary that provides local development utilities for AI agent workflows:
 
-- **Reverse proxy** — access any `localhost:<port>` via named `https://<name>.test` URLs, managed via CLI
+- **Reverse proxy** — access any `localhost:<port>` via named `https://<name>.<domain>` URLs, managed via CLI
+- **Custom domain** — drop a wildcard certificate into the cert dir and aru routes every service under its suffix
 - **File upload** — drag-drop/paste file upload with `@`-prefixed path for AI agents
-- **Built-in DNS** — automatically resolves `*.test` domains to your machine's IP (zero-config)
+- **Built-in DNS** — automatically resolves `*.<domain>` domains to your machine's IP (zero-config)
 - **Worktree manager** — create/remove/open/list git worktrees with tmux sessions and RAM-backed data
 - **Auto-cleanup** — uploaded files clean up after 1 hour
 - **Minimal dependencies** — only `golang.org/x/net/ipv4` (Go team-maintained sub-repo); everything else is Go standard library
@@ -24,9 +25,36 @@ sudo systemctl enable --now aru
 
 ## Features
 
-### 🌐 Reverse proxy for `*.test` domains
+### 🏷️ Custom domain from a wildcard certificate
 
-Access any local dev server via a named `https://<name>.test` URL — no more `localhost:3000`. Names can contain dots for multi-level subdomains (e.g., `https://api.myapp.test/` → `http://localhost:3001/`).
+By default aru generates a self-signed certificate for `*.test` and routes every service under `.test`. To use your own domain, put a wildcard certificate in the cert directory and restart aru:
+
+```bash
+cp cert.pem key.pem ~/.aru/
+sudo systemctl restart aru
+```
+
+aru reads the **first wildcard DNS SAN** from `cert.pem` and adopts its suffix everywhere — reverse proxy, upload host, and built-in DNS:
+
+| Certificate SANs | Routing domain | Upload host | Proxy hosts |
+|------------------|----------------|-------------|-------------|
+| `*.example.com` | `example.com` | `tmp.example.com` | `myapp.example.com` |
+| `*.example.com`, `*.lab.internal` | `example.com` (first wildcard) | `tmp.example.com` | `myapp.example.com` |
+| none — aru generates `*.test` | `test` | `tmp.test` | `myapp.test` |
+
+The certificate is authoritative, so aru protects it:
+
+- aru **never rewrites** a certificate pair it did not generate — your files are used as-is
+- a certificate without any wildcard SAN fails with an explanatory error (add a `*.yourdomain` SAN, or remove the pair so aru can generate `*.test`)
+- an expired certificate you supplied is reported rather than replaced; only aru's own expired certificate is regenerated
+- a `cert.pem` without `key.pem` (or a mismatched pair) is an error instead of silently overwriting your files
+- the adopted suffix must resolve to this machine — use your own DNS, or let the built-in DNS answer A-record queries for it
+
+Only the **first** wildcard is used, so `*.example.com` + `*.lab.internal` routes `<name>.example.com` and leaves `*.lab.internal` alone.
+
+### 🌐 Reverse proxy for `<name>.<domain>`
+
+Access any local dev server via a named `https://<name>.<domain>` URL — no more `localhost:3000`. `<domain>` is `test` for the generated certificate, or the suffix adopted from your wildcard certificate. Names can contain dots for multi-level subdomains (e.g., `https://api.myapp.test/` → `http://localhost:3001/`).
 
 ```bash
 # Add a proxy entry
@@ -45,15 +73,15 @@ aru proxy del --name=myapp
 - Proxy entries are persisted in `~/.aru/proxies.json` (survives restarts)
 - Edits to `proxies.json` are picked up at runtime (hot-reload via mtime check)
 - WebSocket support works automatically (Vite, Next.js hot-reload)
-- Host header is preserved as `*.test` (upstream sees the original hostname)
+- Host header is preserved as the original proxy hostname (upstream sees `<name>.<domain>`)
 - Blocked ports: 53 (DNS), 80 (HTTP), 443 (HTTPS) — prevents loops
 - Unknown proxy names → 404 Not Found
 - **Multi-proxy support**: `aru.json` can register multiple proxies for multiple services in one worktree (see [aru.json schema](#🔐-trust-model-for-arujson-commands))
 - **Dots in names**: Proxy names may contain dots for multi-level subdomains (e.g., `api.myapp.test`)
 
-### 📁 File upload at `tmp.test`
+### 📁 File upload at `tmp.<domain>`
 
-Open `https://tmp.test/` for a dark-themed upload UI:
+Open `https://tmp.test/` (or `https://tmp.<domain>/` with a custom certificate) for a dark-themed upload UI:
 
 - **Click** to select files (stages them — press Upload to confirm)
 - **Drag and drop** files onto the drop zone (auto-uploads immediately)
@@ -62,14 +90,14 @@ Open `https://tmp.test/` for a dark-themed upload UI:
 
 ### 🧠 Built-in DNS (port 53)
 
-The built-in DNS server automatically resolves `*.test` domains to your machine's IP:
+The built-in DNS server automatically resolves `*.<domain>` domains (`*.test` by default) to your machine's IP:
 
 - It uses **IP_PKTINFO** socket control messages (via `golang.org/x/net/ipv4`) to extract the **exact destination IP** each DNS query arrived on — no subnet matching, no heuristics
 - This works correctly with **any interface type**: Tailscale (`/32`), LAN (`/24`), Docker bridges, VPNs — the kernel tells us the IP directly
 - Queries from a remote Tailscale client → the server's **Tailscale IP** (e.g., `100.x.x.x`)
 - Queries from local machine → `127.0.0.1`
 - Queries from LAN devices → your machine's LAN IP
-- Non-`.test` queries → REFUSED (allows client fallback to secondary DNS)
+- Non-matching queries (other suffixes) → REFUSED (allows client fallback to secondary DNS)
 
 If port 53 is already in use (e.g., `systemd-resolved`), the server logs a warning and continues without DNS — use `/etc/hosts` as fallback.
 
@@ -180,7 +208,7 @@ HTTP requests on port 80 are automatically redirected to HTTPS on port 443.
 
 ### Setup DNS (one-time)
 
-For the `*.test` domains to work, ensure the built-in DNS server can bind port 53:
+For the `*.<domain>` domains to work, ensure the built-in DNS server can bind port 53:
 
 ```bash
 # Check if systemd-resolved is using port 53
@@ -242,7 +270,7 @@ The `--install-service` flag generates the service file at `/etc/systemd/system/
 
 ### API
 
-**POST /upload** (at `https://tmp.test/upload`)
+**POST /upload** (at `https://tmp.<domain>/upload`)
 
 Accepts multipart form data with field `file` or `files`.
 
@@ -262,13 +290,14 @@ Response (multiple files):
 
 ```
 main.go         — entry point, subcommand routing (proxy, worktree), three listeners
-server.go       — virtual host routing (tmp.test → upload, <name>.test → proxy via ProxyDB)
+server.go       — virtual host routing (tmp.<domain> → upload, <name>.<domain> → proxy via ProxyDB)
+domain.go       — routing domain resolution (wildcard SAN → suffix), host matching, upload host
 proxy.go        — reverse proxy handler with WebSocket support, LookupProxy
 proxydb.go      — persistent proxy database (JSON-backed, thread-safe, hot-reload)
 worktree.go     — git worktree manager (add/del/open/list), aru.json config, RAM dir, tmux sessions
 aruconfig.go    — aru.json config types, parsing, struct-walking placeholder resolution
-cert.go         — self-signed TLS certificate with wildcard SANs (*.test, tmp.test)
-dns.go          — built-in DNS server for *.test domains (IP_PKTINFO destination-IP extraction)
+cert.go         — certificate adoption (wildcard SAN → routing domain) and self-signed generation
+dns.go          — built-in DNS server for *.<domain> domains (IP_PKTINFO destination-IP extraction)
 redirect.go     — HTTP → HTTPS redirect server
 upload.go       — file upload handler, name generation
 cleanup.go      — background file cleanup goroutine
@@ -282,7 +311,7 @@ All persistent data lives under `~/.aru/`:
 
 ```
 ~/.aru/
-├── cert.pem          — TLS certificate
+├── cert.pem          — TLS certificate (yours, or generated with *.test SANs)
 ├── key.pem           — TLS private key (0600)
 ├── proxies.json      — Reverse proxy configuration
 ├── state/            — Per-worktree state (ports.json, setup-complete)
@@ -294,7 +323,7 @@ All persistent data lives under `~/.aru/`:
 
 | Port | Protocol | Service | Failure mode |
 |------|----------|---------|-------------|
-| 53 | UDP | DNS (`.test` → interface IP) | Non-fatal — logs warning, continues |
+| 53 | UDP | DNS (`*.<domain>` → interface IP) | Non-fatal — logs warning, continues |
 | 80 | TCP | HTTP → HTTPS redirect | Non-fatal — logs warning, continues |
 | 443 | TCP | HTTPS (file upload + reverse proxy) | Fatal — core service |
 
@@ -302,9 +331,11 @@ All persistent data lives under `~/.aru/`:
 
 | Host | Routes to |
 |------|-----------|
-| `tmp.test` | File upload UI + upload API (with security headers) |
-| `<name>.test` | Reverse proxy to `http://localhost:<port>` via ProxyDB lookup (no security headers) |
+| `tmp.<domain>` | File upload UI + upload API (with security headers) |
+| `<name>.<domain>` | Reverse proxy to `http://localhost:<port>` via ProxyDB lookup (no security headers) |
 | anything else | 404 Not Found |
+
+`<domain>` is `test` unless a wildcard certificate in the cert dir sets a different suffix — see [Custom domain](#🏷️-custom-domain-from-a-wildcard-certificate).
 
 ### Packages
 
@@ -337,9 +368,9 @@ go tool cover -func=coverage.out
 ## Security
 
 - **TLS 1.2 minimum** — connections below TLS 1.2 are rejected
-- **Self-signed cert** — auto-generated with 10-year validity, wildcard SAN for `*.test`, `tmp.test`, `localhost`
+- **Self-signed cert** — generated with 10-year validity and wildcard SANs for `*.test`, `tmp.test`, `localhost`; a certificate you provide replaces it and is never rewritten by aru
 - **Key permissions** — private key stored at `0600` (owner-only)
-- **Security headers** — applied only to file upload routes (`tmp.test`)
+- **Security headers** — applied only to file upload routes (`tmp.<domain>`)
 - **Reverse proxy** — no security headers on proxied responses (upstream controls its own headers)
 - **No file-type validation** — all file types accepted by design
 

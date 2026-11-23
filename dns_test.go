@@ -5,6 +5,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 // buildDNSQuery constructs a wire-format DNS query for the given name and qtype.
@@ -168,26 +169,79 @@ func TestBuildDNSResponse_NonTestGetsRefused(t *testing.T) {
 	}
 }
 
-func TestIsTestDomain(t *testing.T) {
+func TestHasBaseDomain(t *testing.T) {
 	tests := []struct {
-		qname string
-		want  bool
+		qname      string
+		baseDomain string
+		want       bool
 	}{
-		{"foo.test", true},
-		{"bar.test", true},
-		{"3000.test", true},
-		{"test", false},
-		{"foo.com", false},
-		{"foo.test.com", false},
-		{"TEST", false},    // no dots
-		{"foo.TEST", true}, // case-insensitive
-		{"foo.Test", true},
-		{"", false},
+		{"foo.test", "test", true},
+		{"bar.test", "test", true},
+		{"3000.test", "test", true},
+		{"test", "test", false},
+		{"foo.com", "test", false},
+		{"foo.test.com", "test", false},
+		{"TEST", "test", false},    // no dots
+		{"foo.TEST", "test", true}, // case-insensitive
+		{"foo.Test", "test", true},
+		{"", "test", false},
+		{"foo.example.com", "example.com", true},
+		{"a.b.example.com", "example.com", true},
+		{"example.com", "example.com", false},
+		{"foo.test", "example.com", false},
+		{"foo.example.com", "test", false},
+		{"foo.example.com", "", false},
 	}
 	for _, tc := range tests {
-		got := isTestDomain(tc.qname)
-		if got != tc.want {
-			t.Errorf("isTestDomain(%q) = %v, want %v", tc.qname, got, tc.want)
+		if got := hasBaseDomain(tc.qname, tc.baseDomain); got != tc.want {
+			t.Errorf("hasBaseDomain(%q, %q) = %v, want %v", tc.qname, tc.baseDomain, got, tc.want)
+		}
+	}
+}
+
+func TestHandleDNSQuery_BaseDomain(t *testing.T) {
+	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("server ListenUDP error = %v", err)
+	}
+	defer serverConn.Close()
+
+	clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("client ListenUDP error = %v", err)
+	}
+	defer clientConn.Close()
+
+	localIP := net.IPv4(10, 1, 2, 3)
+	tests := []struct {
+		name        string
+		baseDomain  string
+		wantRcode   uint16
+		wantAnswers uint16
+	}{
+		{"api.example.com", "example.com", dnsRcodeSuccess, 1},
+		{"tmp.example.com", "example.com", dnsRcodeSuccess, 1},
+		{"api.test", "example.com", dnsRcodeRefused, 0},
+		{"api.test", "test", dnsRcodeSuccess, 1},
+		{"example.com", "example.com", dnsRcodeRefused, 0},
+	}
+	for _, tc := range tests {
+		query := buildDNSQuery(tc.name, 1)
+		handleDNSQuery(serverConn, clientConn.LocalAddr().(*net.UDPAddr), query, localIP, tc.baseDomain)
+
+		buf := make([]byte, 512)
+		clientConn.SetReadDeadline(time.Now().Add(time.Second))
+		n, _, err := clientConn.ReadFromUDP(buf)
+		if err != nil {
+			t.Fatalf("read response for %q (base %q): %v", tc.name, tc.baseDomain, err)
+		}
+
+		hdr := parseDNSHeader(buf[:n])
+		if rcode := hdr.Flags & 0x000f; rcode != tc.wantRcode {
+			t.Errorf("%q (base %q): rcode = %d, want %d", tc.name, tc.baseDomain, rcode, tc.wantRcode)
+		}
+		if hdr.ANCount != tc.wantAnswers {
+			t.Errorf("%q (base %q): ANCount = %d, want %d", tc.name, tc.baseDomain, hdr.ANCount, tc.wantAnswers)
 		}
 	}
 }
